@@ -12,9 +12,12 @@ Pipeline:
   1. Structure mask: Lab gradients above ``EDGE_THRESHOLD`` (text, lines,
      icon outlines) dilated by one pixel.
   2. Regions: connected components of everything else.
-  3. Per region, a robust masked Gaussian field. A region is cleaned only if
-     ``FLAT_COVERAGE`` of its pixels sit within ``TOLERANCE`` of that field;
-     photographic texture fails this test and is never flattened.
+  3. Per region, a robust masked Gaussian field. A region is flat only if
+     nearly all of its pixels sit near that field (``FLAT_COVERAGE``), and
+     it is a designed fill only if the field itself is near-constant
+     (``FILL_RANGE``). Smooth photo areas (sky, skin) are shaded and fail the
+     second test; images with too little fill area (``MIN_FILL_SHARE``) are
+     returned untouched, so photographs pass through.
   4. Soft blend inside accepted regions: full replacement below
      ``TOLERANCE``, fading to none at ``2 * TOLERANCE``. A hard cut draws
      contour lines through real gradients.
@@ -52,7 +55,19 @@ FIELD_SIGMA = 22.0
 # ~8 on the reference sample, so 7 with a soft fade to 14 covers it.
 TOLERANCE = 7.0
 MIN_REGION_AREA = 24
-FLAT_COVERAGE = 0.95
+# Flat: FLAT_COVERAGE of the pixels within TOLERANCE of the field and
+# FLAT_COVERAGE_WIDE within twice that. Saturated fills carry stronger
+# blotches: the reference green "i" badge has 94% within 7 but 99% within 14.
+FLAT_COVERAGE = 0.90
+FLAT_COVERAGE_WIDE = 0.99
+# A designed fill is near-constant: the 98th percentile distance of its field
+# from the fill's median colour stays within FILL_RANGE. ChatGPT boxes measure
+# 1-2 (vignette included); shaded photo areas exceed it.
+FILL_RANGE = 8.0
+# Images whose large fills cover less than this share are not flat graphics
+# and are returned untouched. ChatGPT infographics measure ~70%; photos from
+# examples/ at most ~35%. Cleaning photos flattened cloud texture into patches.
+MIN_FILL_SHARE = 0.45
 # Ringing beside bold text fuses whole lines into structure; 16px reaches the
 # middle of those blocks on 1K ChatGPT output.
 BAND_RADIUS = 16
@@ -61,6 +76,11 @@ BAND_RADIUS = 16
 # computed by normalised convolution with ``EXTEND_SIGMA``.
 ANCHOR_AREA = 400
 EXTEND_SIGMA = 8.0
+# A smaller fill anchors itself when its colour differs from the surrounding
+# background by DISTINCT_FILL: badges and circles ("SI", "NO"), whose white
+# text leaves only fragments of the fill. Gaps between glyphs share the box
+# colour and stay in the band.
+DISTINCT_FILL = 20.0
 # Two-colour text model in the band. Ink is the colour farthest from the
 # background within ``INK_RADIUS``; it must differ by ``INK_MIN`` to define a
 # text/background line. Band pixels without ink nearby, or lighter than the
@@ -72,8 +92,6 @@ INK_MIN = 20.0
 MAX_INK_ALPHA = 0.35
 LINE_TOLERANCE = 12.0
 BAND_TOLERANCE = 20.0
-# Below this share of flat pixels the image is not a flat graphic.
-MIN_COVERED_FRACTION = 0.05
 # Mean Lab deviation inside flat regions below which there is nothing to
 # clean. A synthetic clean graphic measures 0.0; the reference ChatGPT
 # sample measures above 1.
@@ -116,16 +134,18 @@ def _masked_blur(values: np.ndarray, weight: np.ndarray, sigma: float) -> np.nda
 def _region_fields(lab, labels, stats, only=None):
     """Fit a robust smooth field to each flat region.
 
-    Returns ``(field, covered, deviations, accepted)`` where ``deviations``
-    holds each covered pixel's Lab distance to its field. ``only`` restricts
-    the pass to already-accepted labels, which lets the residual check
-    re-measure exactly the regions that were cleaned.
+    Returns ``(field, covered, deviations, accepted, fill_range)`` where
+    ``deviations`` holds each covered pixel's Lab distance to its field and
+    ``fill_range`` maps an accepted label to the colour range of its field.
+    ``only`` restricts the pass to already-accepted labels, which lets the
+    residual check re-measure exactly the regions that were cleaned.
     """
     height, width = labels.shape
     field = lab.copy()
     covered = np.zeros(labels.shape, bool)
     deviations = np.zeros(labels.shape, np.float32)
     accepted = []
+    fill_range = {}
     pad = int(3 * FIELD_SIGMA)
     candidates = only if only is not None else range(1, len(stats))
 
@@ -147,14 +167,35 @@ def _region_fields(lab, labels, stats, only=None):
         # small genuine feature does not tint the whole fill.
         estimate = _masked_blur(values, weight * (error < 2 * TOLERANCE), sigma)
         error = np.sqrt(((values - estimate) ** 2).sum(2))
-        if only is None and (error[inside] < TOLERANCE).mean() < FLAT_COVERAGE:
-            continue
+        if only is None:
+            region_error = error[inside]
+            if (
+                (region_error < TOLERANCE).mean() < FLAT_COVERAGE
+                or (region_error < 2 * TOLERANCE).mean() < FLAT_COVERAGE_WIDE
+            ):
+                continue
+            colours = estimate[inside]
+            spread = np.sqrt(((colours - np.median(colours, axis=0)) ** 2).sum(1))
+            fill_range[label] = float(np.percentile(spread, 98))
 
         field[y0:y1, x0:x1][inside] = estimate[inside]
         deviations[y0:y1, x0:x1][inside] = error[inside]
         covered[y0:y1, x0:x1] |= inside
         accepted.append(label)
-    return field, covered, deviations, accepted
+    return field, covered, deviations, accepted, fill_range
+
+
+def _distinct_fills(field, background, labels, stats, candidates):
+    """Small fills whose colour differs from the background around them."""
+    distinct = []
+    for label in candidates:
+        x, y, box_w, box_h, _ = stats[label]
+        inside = labels[y:y + box_h, x:x + box_w] == label
+        own = field[y:y + box_h, x:x + box_w][inside].mean(axis=0)
+        around = background[y:y + box_h, x:x + box_w][inside].mean(axis=0)
+        if np.sqrt(((own - around) ** 2).sum()) >= DISTINCT_FILL:
+            distinct.append(label)
+    return distinct
 
 
 def _extend_background(field, labels, stats, anchors):
@@ -237,24 +278,27 @@ def clean_stains(image: Image.Image) -> tuple[Image.Image, dict]:
     lab = _to_lab(rgb)
     structure = _structure_mask(lab)
     _, labels, stats, _ = cv2.connectedComponentsWithStats(1 - structure, connectivity=4)
-    field, covered, deviations, accepted = _region_fields(lab, labels, stats)
+    field, covered, deviations, accepted, fill_range = _region_fields(lab, labels, stats)
+    fills = [label for label in accepted if fill_range[label] <= FILL_RANGE]
+    large = [label for label in fills if stats[label][4] >= ANCHOR_AREA]
+    fill_mask = np.isin(labels, fills)
 
     report = {
         "covered_fraction": round(float(covered.mean()), 4),
-        "regions": len(accepted),
-        "stain_energy_before": round(_stain_energy(deviations, covered), 4),
+        "fill_share": round(float(stats[large, 4].sum() / labels.size) if large else 0.0, 4),
+        "regions": len(fills),
+        "stain_energy_before": round(_stain_energy(deviations, fill_mask), 4),
     }
     if (
-        report["covered_fraction"] < MIN_COVERED_FRACTION
+        report["fill_share"] < MIN_FILL_SHARE
         or report["stain_energy_before"] < MIN_STAIN_ENERGY
     ):
         report.update(changed_fraction=0.0, stain_energy_after=report["stain_energy_before"])
         return image, report
 
-    anchors = [label for label in accepted if stats[label][4] >= ANCHOR_AREA]
-    if not anchors:
-        report.update(changed_fraction=0.0, stain_energy_after=report["stain_energy_before"])
-        return image, report
+    background, _, _ = _extend_background(field, labels, stats, large)
+    small = [label for label in fills if stats[label][4] < ANCHOR_AREA]
+    anchors = large + _distinct_fills(field, background, labels, stats, small)
     background, anchored, distance = _extend_background(field, labels, stats, anchors)
     band = ~anchored & (distance <= BAND_RADIUS)
 
@@ -270,8 +314,8 @@ def clean_stains(image: Image.Image) -> tuple[Image.Image, dict]:
     output[changed] = cleaned_rgb[changed]
     result = Image.fromarray(output)
 
-    _, after_covered, after_deviations, _ = _region_fields(
-        _to_lab(output), labels, stats, only=accepted
+    _, after_covered, after_deviations, _, _ = _region_fields(
+        _to_lab(output), labels, stats, only=fills
     )
     report["changed_fraction"] = round(float(changed.mean()), 4)
     report["stain_energy_after"] = round(_stain_energy(after_deviations, after_covered), 4)

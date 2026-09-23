@@ -26,11 +26,14 @@ import { CompareSlider } from "./components/CompareSlider";
 import { ManualMaskEditor } from "./components/ManualMaskEditor";
 import type { ManualRegion } from "./components/ManualMaskEditor";
 import { MagneticButton } from "./components/MagneticButton";
+import { Waifu2xControls } from "./components/Waifu2xControls";
+import { defaultWaifu2xSettings } from "./waifu2x";
+import type { Waifu2xSettings } from "./waifu2x";
 import { useLocale } from "./i18n";
 import type { Copy } from "./i18n";
 
 type ResultStatus = "cleaned" | "no_watermark" | "error";
-type ProcessMode = "watermark" | "stains";
+type ProcessMode = "watermark" | "stains" | "waifu2x";
 type TaskPhase = "ready" | "queued" | "uploading" | "processing" | "done" | "error";
 type UiErrorCode = "connection" | "serverStatus" | "missingResult" | "incompleteResult" | "processing" | "download" | "unknown";
 
@@ -123,7 +126,8 @@ function normalizeResult(raw: Partial<ProcessResult> | undefined, file: File): P
 function processImage(
   entry: ImageEntry,
   mode: ProcessMode,
-  upscale: boolean,
+  enhance: boolean,
+  waifu2x: Waifu2xSettings,
   onProgress: (phase: "uploading" | "processing", progress: number) => void,
 ) {
   return new Promise<ProcessResult>((resolve, reject) => {
@@ -131,7 +135,10 @@ function processImage(
     const formData = new FormData();
     formData.append("files", entry.file);
     formData.append("mode", mode);
-    formData.append("upscale", String(mode === "stains" && upscale));
+    formData.append("enhance", String(mode === "stains" && enhance));
+    formData.append("waifu2x_model", waifu2x.model);
+    formData.append("waifu2x_scale", String(waifu2x.scale));
+    formData.append("waifu2x_noise", String(waifu2x.noise));
 
     request.open("POST", "/api/remove");
     request.responseType = "json";
@@ -223,6 +230,8 @@ function QueueStatus({ entry, t }: { entry: ImageEntry; t: Copy }) {
         {entry.result.status === "cleaned"
           ? entry.result.mode === "stains"
             ? t.stainsCleaned
+            : entry.result.mode === "waifu2x"
+            ? t.waifu2xDone
             : t.removedCount(entry.result.watermarks_found)
           : entry.result.status === "no_watermark"
             ? t.noMarkReady
@@ -314,7 +323,8 @@ export default function App() {
   const [message, setMessage] = useState<UiMessage | null>(null);
   const [manualEditingId, setManualEditingId] = useState<string | null>(null);
   const [mode, setMode] = useState<ProcessMode>("watermark");
-  const [upscale, setUpscale] = useState(false);
+  const [enhance, setEnhance] = useState(false);
+  const [waifu2x, setWaifu2x] = useState<Waifu2xSettings>(defaultWaifu2xSettings);
   const imagesRef = useRef<ImageEntry[]>([]);
 
   useEffect(() => {
@@ -425,7 +435,7 @@ export default function App() {
         return next;
       });
       try {
-        const result = await processImage(target, mode, upscale, (phase, uploadProgress) => {
+        const result = await processImage(target, mode, enhance, waifu2x, (phase, uploadProgress) => {
           setImages((current) =>
             current.map((entry) =>
               entry.id === target.id ? { ...entry, phase, uploadProgress } : entry,
@@ -754,8 +764,8 @@ export default function App() {
             <legend className="mb-2 font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--ink-faint)]">
               {t.modeLabel}
             </legend>
-            <div className="grid grid-cols-2 gap-1 rounded-full border border-[var(--line)] bg-[var(--paper)] p-1" role="radiogroup">
-              {(["watermark", "stains"] as const).map((option) => (
+            <div className="grid grid-cols-3 gap-1 rounded-full border border-[var(--line)] bg-[var(--paper)] p-1" role="radiogroup">
+              {(["watermark", "stains", "waifu2x"] as const).map((option) => (
                 <button
                   key={option}
                   type="button"
@@ -768,7 +778,7 @@ export default function App() {
                       : "text-[var(--ink-muted)] hover:text-[var(--ink)]"
                   }`}
                 >
-                  {option === "watermark" ? t.modeWatermark : t.modeStains}
+                  {option === "watermark" ? t.modeWatermark : option === "stains" ? t.modeStains : t.modeWaifu2x}
                 </button>
               ))}
             </div>
@@ -779,14 +789,21 @@ export default function App() {
                   <input
                     type="checkbox"
                     className="mt-1 accent-[var(--accent)]"
-                    checked={upscale}
-                    onChange={(event) => setUpscale(event.target.checked)}
+                    checked={enhance}
+                    onChange={(event) => setEnhance(event.target.checked)}
                   />
                   <span>
-                    <span className="block font-medium">{t.upscaleLabel}</span>
-                    <span className="block text-xs leading-5 text-[var(--ink-muted)]">{t.upscaleHint}</span>
+                    <span className="block font-medium">{t.enhanceLabel}</span>
+                    <span className="block text-xs leading-5 text-[var(--ink-muted)]">{t.enhanceHint}</span>
                   </span>
                 </label>
+                {enhance && <Waifu2xControls settings={waifu2x} onChange={setWaifu2x} t={t} />}
+              </>
+            )}
+            {mode === "waifu2x" && (
+              <>
+                <p className="mt-2 text-xs leading-5 text-[var(--ink-muted)]">{t.modeWaifu2xHint}</p>
+                <Waifu2xControls settings={waifu2x} onChange={setWaifu2x} t={t} />
               </>
             )}
           </fieldset>

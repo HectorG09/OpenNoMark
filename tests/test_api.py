@@ -175,36 +175,75 @@ class TestAPI:
         assert result["download_url"] is None
         assert "Residual watermark" in result["error"]
 
-    def test_stains_mode_uses_the_light_pipeline_and_forwards_upscale(
-        self, client, sample_image, monkeypatch
+    class LightPipeline:
+        def __init__(self):
+            self.calls = []
+
+        def process(self, input_path, output_path):
+            raise AssertionError("the watermark pipeline must not run in this mode")
+
+        def _copy(self, name, input_path, output_path, settings):
+            self.calls.append((name, settings))
+            image = Image.open(input_path).convert("RGB")
+            image.save(output_path)
+            return image, {"status": "cleaned", "watermarks_found": 0}
+
+        def process_stains(self, input_path, output_path, waifu2x):
+            return self._copy("stains", input_path, output_path, waifu2x)
+
+        def process_waifu2x(self, input_path, output_path, settings):
+            return self._copy("waifu2x", input_path, output_path, settings)
+
+    @pytest.mark.parametrize(
+        "form, expected",
+        [
+            ({"mode": "stains"}, ("stains", None)),
+            ({"mode": "stains", "enhance": "true"}, ("stains", ("art", 2, 1))),
+            (
+                {"mode": "waifu2x", "waifu2x_model": "photo", "waifu2x_scale": "4", "waifu2x_noise": "-1"},
+                ("waifu2x", ("photo", 4, -1)),
+            ),
+        ],
+    )
+    def test_light_modes_forward_waifu2x_settings(
+        self, client, sample_image, monkeypatch, form, expected
     ):
         import opennomark.api as api
 
-        calls = []
-
-        class StainPipeline:
-            def process(self, input_path, output_path):
-                raise AssertionError("watermark pipeline must not run in stains mode")
-
-            def process_stains(self, input_path, output_path, upscale):
-                calls.append(upscale)
-                image = Image.open(input_path).convert("RGB")
-                image.save(output_path)
-                return image, {"status": "cleaned", "watermarks_found": 1}
-
-        monkeypatch.setattr(api, "_stain_pipeline", StainPipeline())
-        monkeypatch.setattr(api, "_pipeline", StainPipeline())
+        pipeline = self.LightPipeline()
+        monkeypatch.setattr(api, "_light_pipeline", pipeline)
+        monkeypatch.setattr(api, "_pipeline", pipeline)
         with open(sample_image, "rb") as file:
             response = client.post(
                 "/api/remove",
                 files=[("files", ("chart.png", file, "image/png"))],
-                data={"mode": "stains", "upscale": "true"},
+                data=form,
             )
 
         result = response.json()["results"][0]
         assert result["status"] == "cleaned"
-        assert result["mode"] == "stains"
-        assert calls == [True]
+        assert result["mode"] == form["mode"]
+        (name, settings), = pipeline.calls
+        assert name == expected[0]
+        received = None if settings is None else (settings.model, settings.scale, settings.noise)
+        assert received == expected[1]
+
+    @pytest.mark.parametrize(
+        "form",
+        [
+            {"mode": "waifu2x", "waifu2x_scale": "1", "waifu2x_noise": "-1"},
+            {"mode": "waifu2x", "waifu2x_model": "anime"},
+            {"mode": "waifu2x", "waifu2x_scale": "3"},
+        ],
+    )
+    def test_invalid_waifu2x_settings_are_rejected(self, client, sample_image, form):
+        with open(sample_image, "rb") as file:
+            response = client.post(
+                "/api/remove",
+                files=[("files", ("chart.png", file, "image/png"))],
+                data=form,
+            )
+        assert response.status_code == 422
 
     def test_unknown_mode_is_rejected(self, client, sample_image):
         with open(sample_image, "rb") as file:

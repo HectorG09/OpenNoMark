@@ -68,3 +68,28 @@ def test_photographic_texture_is_not_flattened(seed):
 
     assert result is texture
     assert report["covered_fraction"] < 0.05
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        # Portrait whose sky and hair were flattened into patches before the
+        # fill-share guard existed.
+        "doubao/生成超写实时尚人像 (5).png",
+        "doubao/生成超写实时尚人像 (2).png",
+        "gemini/gemini_sample_1.png",
+        "qwen/image_324855086256596.png",
+    ],
+)
+def test_real_photos_are_returned_untouched(relative):
+    from pathlib import Path
+
+    path = Path(__file__).parent.parent / "examples" / relative
+    if not path.exists():
+        pytest.skip(f"{relative} not available")
+    image = Image.open(path).convert("RGB")
+    image.thumbnail((1200, 1200))
+    result, report = clean_stains(image)
+
+    assert result is image
+    assert report["fill_share"] < 0.45

@@ -22,6 +22,7 @@ from starlette.background import BackgroundTask
 
 from . import __version__
 from .metadata import strip_metadata
+from .enhancer import Waifu2xSettings
 from .pipeline import MODES
 
 app = FastAPI(title="OpenNoMark", version=__version__)
@@ -37,8 +38,8 @@ app.add_middleware(
 # inference runs in worker threads instead of blocking the ASGI event loop.
 _pipeline = None
 _pipeline_init_lock = threading.Lock()
-# Stains mode needs neither OWLv2 nor LaMa; waifu2x loads lazily inside it.
-_stain_pipeline = None
+# Stains and waifu2x modes need neither OWLv2 nor LaMa; waifu2x loads lazily.
+_light_pipeline = None
 
 
 def _configured_concurrency() -> int:
@@ -163,15 +164,15 @@ def get_pipeline():
     return _pipeline
 
 
-def get_stain_pipeline():
-    global _stain_pipeline
-    if _stain_pipeline is None:
+def get_light_pipeline():
+    global _light_pipeline
+    if _light_pipeline is None:
         with _pipeline_init_lock:
-            if _stain_pipeline is None:
+            if _light_pipeline is None:
                 from .pipeline import WatermarkRemovalPipeline
 
-                _stain_pipeline = WatermarkRemovalPipeline(verbose=False, load_models=False)
-    return _stain_pipeline
+                _light_pipeline = WatermarkRemovalPipeline(verbose=False, load_models=False)
+    return _light_pipeline
 
 
 def _copy_without_metadata(source: Path, destination: Path) -> None:
@@ -185,7 +186,7 @@ def _save_upload(upload: UploadFile, input_path: Path) -> None:
 
 
 async def _process_upload(
-    upload: UploadFile, pipeline, mode: str = "watermark", upscale: bool = False
+    upload: UploadFile, pipeline, mode: str = "watermark", waifu2x=None
 ) -> dict:
     if not upload.content_type or not upload.content_type.startswith("image/"):
         return {"filename": upload.filename, "error": "Not an image file"}
@@ -203,7 +204,14 @@ async def _process_upload(
                     pipeline.process_stains,
                     str(input_path),
                     str(output_path),
-                    upscale,
+                    waifu2x,
+                )
+            elif mode == "waifu2x":
+                _, meta = await asyncio.to_thread(
+                    pipeline.process_waifu2x,
+                    str(input_path),
+                    str(output_path),
+                    waifu2x,
                 )
             else:
                 _, meta = await asyncio.to_thread(
@@ -258,15 +266,27 @@ def health():
 async def remove_watermark(
     files: list[UploadFile] = File(...),
     mode: Annotated[str, Form()] = "watermark",
-    upscale: Annotated[bool, Form()] = False,
+    enhance: Annotated[bool, Form()] = False,
+    waifu2x_model: Annotated[str, Form()] = Waifu2xSettings.model,
+    waifu2x_scale: Annotated[int, Form()] = Waifu2xSettings.scale,
+    waifu2x_noise: Annotated[int, Form()] = Waifu2xSettings.noise,
 ):
-    """Remove watermarks (or ChatGPT stains) with bounded, shared-model concurrency."""
+    """Remove watermarks, clean ChatGPT stains, or run waifu2x.
+
+    ``enhance`` adds waifu2x after stain cleanup; waifu2x mode always runs it.
+    Concurrency is bounded and models are shared across requests.
+    """
     if mode not in MODES:
         raise HTTPException(422, f"mode must be one of {', '.join(MODES)}")
-    loader = get_stain_pipeline if mode == "stains" else get_pipeline
+    try:
+        settings = Waifu2xSettings(waifu2x_model, waifu2x_scale, waifu2x_noise)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    waifu2x = settings if mode == "waifu2x" or (mode == "stains" and enhance) else None
+    loader = get_pipeline if mode == "watermark" else get_light_pipeline
     pipeline = await asyncio.to_thread(loader)
     results = await asyncio.gather(
-        *(_process_upload(upload, pipeline, mode, upscale) for upload in files)
+        *(_process_upload(upload, pipeline, mode, waifu2x) for upload in files)
     )
     return {"results": results}
 

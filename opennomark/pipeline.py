@@ -5,10 +5,11 @@ import threading
 
 from PIL import Image, ImageChops, ImageFilter
 
+from .enhancer import Waifu2xSettings
 from .metadata import strip_metadata
 from .stain_cleaner import MAX_RESIDUAL_RATIO, clean_stains
 
-MODES = ("watermark", "stains")
+MODES = ("watermark", "stains", "waifu2x")
 
 
 class WatermarkRemovalPipeline:
@@ -34,7 +35,7 @@ class WatermarkRemovalPipeline:
 
     @property
     def enhancer(self):
-        """waifu2x, loaded on first use: it downloads ~420MB of models."""
+        """waifu2x, created on first use; its models download on first run (~420MB)."""
         if self._enhancer is None:
             with self._enhancer_lock:
                 if self._enhancer is None:
@@ -217,22 +218,23 @@ class WatermarkRemovalPipeline:
             },
         }
 
-    def process_stains(self, image_path, output_path=None, upscale=False):
-        """Clean ChatGPT-style blotches in flat fills; optionally upscale 2x.
+    def process_stains(self, image_path, output_path=None, waifu2x=None):
+        """Clean ChatGPT-style blotches in flat fills, then optionally waifu2x.
 
-        The watermark localizer does not run in this mode: on flat
-        infographics OWLv2 proposes headline text as a watermark, and the
-        reference ChatGPT sample lost its title that way. Validation mirrors
-        ``process``: the stain energy of the cleaned regions is re-measured
-        and must drop by ``MAX_RESIDUAL_RATIO``.
+        ``waifu2x`` is a ``Waifu2xSettings`` or None. The watermark localizer
+        does not run in this mode: on flat infographics OWLv2 proposes
+        headline text as a watermark, and the reference ChatGPT sample lost
+        its title that way. Validation mirrors ``process``: the stain energy
+        of the cleaned regions is re-measured and must drop by
+        ``MAX_RESIDUAL_RATIO``.
         """
         image = Image.open(image_path).convert("RGB")
         result, report = clean_stains(image)
         stains_cleaned = result is not image
         methods = ["flat_region_stain_cleanup"] if stains_cleaned else []
-        if upscale:
-            result = self.enhancer.upscale(result)
-            methods.append("waifu2x_noise_scale2x")
+        if waifu2x is not None:
+            result = self.enhancer.enhance(result, waifu2x)
+            methods.append(waifu2x.label)
 
         passed = (
             not stains_cleaned
@@ -251,6 +253,24 @@ class WatermarkRemovalPipeline:
             "status": ("cleaned" if passed else "partial") if methods else "no_watermark",
         }
         if output_path and methods:
+            self._save_result(result, image_path, output_path)
+        return result, metadata
+
+    def process_waifu2x(self, image_path, output_path=None, settings=Waifu2xSettings()):
+        """Run waifu2x alone with the caller's model, scale and noise level."""
+        image = Image.open(image_path).convert("RGB")
+        result = self.enhancer.enhance(image, settings)
+        metadata = {
+            "input": image_path,
+            "mode": "waifu2x",
+            "methods": [settings.label],
+            "watermarks_found": 0,
+            "regions": [],
+            "boxes": [],
+            "validation": {"passed": True, "attempts": 1},
+            "status": "cleaned",
+        }
+        if output_path:
             self._save_result(result, image_path, output_path)
         return result, metadata
 
@@ -276,7 +296,7 @@ class WatermarkRemovalPipeline:
 
     def process_batch(
         self, image_paths, output_dir, save_debug=False, callback=None,
-        mode="watermark", upscale=False,
+        mode="watermark", waifu2x=None,
     ):
         """Process multiple images. callback(i, total, metadata) for progress."""
         os.makedirs(output_dir, exist_ok=True)
@@ -292,7 +312,9 @@ class WatermarkRemovalPipeline:
             out_path = os.path.join(output_dir, out_name)
 
             if mode == "stains":
-                _, meta = self.process_stains(path, out_path, upscale=upscale)
+                _, meta = self.process_stains(path, out_path, waifu2x=waifu2x)
+            elif mode == "waifu2x":
+                _, meta = self.process_waifu2x(path, out_path, waifu2x or Waifu2xSettings())
             else:
                 _, meta = self.process(path, out_path, save_debug=save_debug)
             meta["output"] = out_path

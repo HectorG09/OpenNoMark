@@ -54,8 +54,18 @@ export interface Copy {
   modeWatermark: string;
   modeStains: string;
   modeStainsHint: string;
-  upscaleLabel: string;
-  upscaleHint: string;
+  modeWaifu2x: string;
+  modeWaifu2xHint: string;
+  enhanceLabel: string;
+  enhanceHint: string;
+  waifu2xDone: string;
+  waifu2xModel: string;
+  waifu2xModels: Record<"art" | "art_scan" | "photo", string>;
+  waifu2xModelHints: Record<"art" | "art_scan" | "photo", string>;
+  waifu2xScale: string;
+  waifu2xScale4Hint: string;
+  waifu2xNoise: string;
+  waifu2xNoiseOff: string;
   needsAttention: string;
   ready: string;
   comparisonEmptyTitle: string;
@@ -164,8 +174,22 @@ const en: Copy = {
   modeWatermark: "Watermark",
   modeStains: "ChatGPT stains",
   modeStainsHint: "Flattens the blotches ChatGPT leaves in solid fills. Text, lines and icons stay untouched.",
-  upscaleLabel: "Upscale 2x with waifu2x",
-  upscaleHint: "AI super-resolution. The first run downloads about 420 MB of models.",
+  modeWaifu2x: "waifu2x",
+  modeWaifu2xHint: "AI denoising and upscaling only, with your own settings. No stain or watermark removal.",
+  enhanceLabel: "Enhance with waifu2x",
+  enhanceHint: "AI denoising and upscaling after the cleanup. The first run downloads about 420 MB of models.",
+  waifu2xDone: "Enhanced with waifu2x",
+  waifu2xModel: "Model",
+  waifu2xModels: { art: "Art", art_scan: "Art scan", photo: "Photo" },
+  waifu2xModelHints: {
+    art: "Art: flat graphics, illustrations and infographics.",
+    art_scan: "Art scan: scanned artwork; can add paper texture to flat white.",
+    photo: "Photo: photographs and realistic images.",
+  },
+  waifu2xScale: "Upscale",
+  waifu2xScale4Hint: "4× is much slower and makes very large files.",
+  waifu2xNoise: "Noise reduction",
+  waifu2xNoiseOff: "Off",
   needsAttention: "Needs attention",
   ready: "Ready",
   comparisonEmptyTitle: "Your comparison appears here",
@@ -274,8 +298,22 @@ const zhCN: Copy = {
   modeWatermark: "水印",
   modeStains: "ChatGPT 斑点",
   modeStainsHint: "抚平 ChatGPT 在纯色区域留下的斑点，文字、线条和图标保持不变。",
-  upscaleLabel: "用 waifu2x 放大 2 倍",
-  upscaleHint: "AI 超分辨率。首次使用会下载约 420 MB 模型。",
+  modeWaifu2x: "waifu2x",
+  modeWaifu2xHint: "仅用 AI 降噪和放大，参数自选。不去除斑点或水印。",
+  enhanceLabel: "用 waifu2x 增强",
+  enhanceHint: "清理后进行 AI 降噪和放大。首次使用会下载约 420 MB 模型。",
+  waifu2xDone: "已用 waifu2x 增强",
+  waifu2xModel: "模型",
+  waifu2xModels: { art: "插画", art_scan: "扫描插画", photo: "照片" },
+  waifu2xModelHints: {
+    art: "插画：纯色图形、插画和信息图。",
+    art_scan: "扫描插画：扫描的画作；可能给纯白区域加上纸张纹理。",
+    photo: "照片：摄影和写实图像。",
+  },
+  waifu2xScale: "放大",
+  waifu2xScale4Hint: "4× 明显更慢，文件也非常大。",
+  waifu2xNoise: "降噪",
+  waifu2xNoiseOff: "关",
   needsAttention: "需要处理",
   ready: "就绪",
   comparisonEmptyTitle: "处理前后对比将在这里显示",

@@ -7,6 +7,7 @@ import os
 import sys
 
 from . import __version__
+from .enhancer import MODEL_TYPES, NOISE_LEVELS, SCALES, Waifu2xSettings
 
 
 def resolve_paths(inputs):
@@ -60,13 +61,26 @@ def main():
         help="Device: cpu, cuda, mps (default: auto)",
     )
     parser.add_argument(
-        "--mode", choices=("watermark", "stains"), default="watermark",
+        "--mode", choices=("watermark", "stains", "waifu2x"), default="watermark",
         help="watermark: detect and inpaint marks (default); "
-             "stains: clean ChatGPT blotches in flat fills",
+             "stains: clean ChatGPT blotches in flat fills; "
+             "waifu2x: denoise and/or upscale only",
     )
     parser.add_argument(
         "--upscale", action="store_true",
-        help="Stains mode: also upscale 2x with waifu2x",
+        help="Stains mode: run waifu2x after cleanup (settings below)",
+    )
+    parser.add_argument(
+        "--waifu2x-model", choices=MODEL_TYPES, default=Waifu2xSettings.model,
+        help="waifu2x model: art (flat graphics, default), art_scan, photo",
+    )
+    parser.add_argument(
+        "--waifu2x-scale", type=int, choices=SCALES, default=Waifu2xSettings.scale,
+        help="waifu2x upscale factor (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--waifu2x-noise", type=int, choices=NOISE_LEVELS, default=Waifu2xSettings.noise,
+        help="waifu2x noise reduction: -1 off, 0-3 (default: %(default)s)",
     )
 
     args = parser.parse_args()
@@ -91,6 +105,12 @@ def main():
 
     if args.upscale and args.mode != "stains":
         parser.error("--upscale requires --mode stains")
+    try:
+        waifu2x = Waifu2xSettings(args.waifu2x_model, args.waifu2x_scale, args.waifu2x_noise)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.mode == "watermark" or (args.mode == "stains" and not args.upscale):
+        waifu2x = None
 
     device = args.device
     try:
@@ -117,7 +137,7 @@ def main():
         status = meta["status"]
         found = meta["watermarks_found"]
         name = os.path.basename(meta["input"])
-        if status == "cleaned" and args.mode == "stains":
+        if status == "cleaned" and args.mode != "watermark":
             print(f"  [{i}/{total}] {name} -> {', '.join(meta['methods'])}")
         elif status == "cleaned":
             print(f"  [{i}/{total}] {name} -> {found} watermark(s) removed")
@@ -131,7 +151,7 @@ def main():
             save_debug=args.debug,
             callback=on_progress,
             mode=args.mode,
-            upscale=args.upscale,
+            waifu2x=waifu2x,
         )
     except Exception as exc:
         if args.json:

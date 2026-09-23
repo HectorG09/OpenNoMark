@@ -52,6 +52,14 @@ class TestCLI:
         assert result.returncode != 0
         assert "--upscale requires --mode stains" in result.stderr
 
+    def test_waifu2x_noop_combination_is_rejected(self, sample_image, output_dir):
+        result = self.run_cli(
+            sample_image, "-o", output_dir, "--mode", "waifu2x",
+            "--waifu2x-scale", "1", "--waifu2x-noise", "-1",
+        )
+        assert result.returncode != 0
+        assert "does nothing" in result.stderr
+
     def test_stains_mode(self, stained_graphic_path, output_dir):
         result = self.run_cli(stained_graphic_path, "-o", output_dir, "--mode", "stains")
         assert result.returncode == 0, result.stderr

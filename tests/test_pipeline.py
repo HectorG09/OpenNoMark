@@ -170,15 +170,43 @@ class TestStainsMode:
 
         assert Image.open(output).info.get("icc_profile") == icc
 
-    def test_upscale_uses_the_enhancer(self, pipeline, stained_graphic_path, tmp_path):
-        class DoubleSize:
-            def upscale(self, image):
-                return image.resize((image.width * 2, image.height * 2))
+    class ScaleBy:
+        """Stands in for waifu2x: resizes by the requested scale."""
 
-        pipeline._enhancer = DoubleSize()
+        def __init__(self):
+            self.calls = []
+
+        def enhance(self, image, settings):
+            self.calls.append(settings)
+            return image.resize((image.width * settings.scale, image.height * settings.scale))
+
+    def test_stains_then_waifu2x_uses_the_callers_settings(
+        self, pipeline, stained_graphic_path, tmp_path
+    ):
+        from opennomark.enhancer import Waifu2xSettings
+
+        pipeline._enhancer = self.ScaleBy()
+        settings = Waifu2xSettings(model="photo", scale=4, noise=-1)
         result, meta = pipeline.process_stains(
-            stained_graphic_path, str(tmp_path / "out.jpg"), upscale=True
+            stained_graphic_path, str(tmp_path / "out.jpg"), waifu2x=settings
         )
 
+        assert pipeline._enhancer.calls == [settings]
+        assert result.size == (1280, 960)
+        assert meta["methods"] == ["flat_region_stain_cleanup", "waifu2x_photo_no_noise_4x"]
+
+    def test_waifu2x_mode_runs_alone_and_strips_metadata(
+        self, pipeline, stained_graphic_path, tmp_path
+    ):
+        from opennomark.enhancer import Waifu2xSettings
+
+        pipeline._enhancer = self.ScaleBy()
+        output = tmp_path / "out.jpg"
+        result, meta = pipeline.process_waifu2x(
+            stained_graphic_path, str(output), Waifu2xSettings(scale=2, noise=3)
+        )
+
+        assert meta["status"] == "cleaned"
+        assert meta["methods"] == ["waifu2x_art_noise3_2x"]
         assert result.size == (640, 480)
-        assert meta["methods"] == ["flat_region_stain_cleanup", "waifu2x_noise_scale2x"]
+        assert b"ChatGPT" not in output.read_bytes()
