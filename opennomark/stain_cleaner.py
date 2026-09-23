@@ -11,26 +11,31 @@ field and leaves text, borders and icons untouched.
 Pipeline:
   1. Structure mask: Lab gradients above ``EDGE_THRESHOLD`` (text, lines,
      icon outlines) dilated by one pixel.
-  2. Regions: connected components of everything else.
-  3. Per region, a robust masked Gaussian field. A region is flat only if
-     nearly all of its pixels sit near that field (``FLAT_COVERAGE``), and
-     it is a designed fill only if the field itself is near-constant
-     (``FILL_RANGE``). Smooth photo areas (sky, skin) are shaded and fail the
-     second test; images with too little fill area (``MIN_FILL_SHARE``) are
-     returned untouched, so photographs pass through.
-  4. Soft blend inside accepted regions: full replacement below
-     ``TOLERANCE``, fading to none at ``2 * TOLERANCE``. A hard cut draws
-     contour lines through real gradients.
+  2. Regions: connected components of everything else. A region is flat
+     only if nearly all of its pixels sit near a robust masked Gaussian
+     field (``FLAT_COVERAGE``).
+  3. Groups: text splits one fill into fragments (line gaps, letter
+     counters), so small flat fragments join a nearby region of the same
+     colour (``GROUP_TOLERANCE``, ``GROUP_RADIUS``) and each group gets one
+     field. A group is a designed fill only if that field is near-constant
+     (``FILL_RANGE``). Smooth photo areas (sky, skin) are shaded and fail
+     this test; images with too little fill area (``MIN_FILL_SHARE``,
+     measured at ChatGPT's resolution) are returned untouched, so
+     photographs pass through.
+  4. Soft blend inside fills: full replacement below ``TOLERANCE``, fading
+     to none at ``2 * TOLERANCE``. A hard cut draws contour lines through
+     real gradients.
   5. Text band: JPEG ringing beside glyphs is strong enough to count as
      structure, so this band is where the most visible blotches live. The
-     field of the nearest large region (``ANCHOR_AREA``) is extended
-     smoothly ``BAND_RADIUS`` pixels into it; small gaps between glyphs are
-     band too, because their own fields are noisy and copying the single
-     nearest value drew streaks and stepped patches. Each band pixel is
-     modelled as a blend of background and the nearest ink (two-colour text
-     model) and projected onto that blend; only mostly-background pixels
-     (``MAX_INK_ALPHA``) are rebuilt, so glyph bodies and their anti-aliasing
-     profile are kept. Pixels lighter than the fill are stain.
+     field of the nearest large group (``ANCHOR_AREA``) on the same side of
+     any hard edge (``HARD_EDGE``) is extended smoothly ``BAND_RADIUS``
+     pixels into it; isolated gaps between glyphs are band too, because
+     their own fields are noisy and copying the single nearest value drew
+     streaks and stepped patches. Each band pixel is modelled as a blend of
+     background and the nearest ink (two-colour text model) and projected
+     onto that blend; only mostly-background pixels (``MAX_INK_ALPHA``) are
+     rebuilt, so glyph bodies and their anti-aliasing profile are kept.
+     Pixels lighter than the fill are stain.
 
 Untouched pixels are copied from the input bit for bit. Distances are
 Euclidean in OpenCV's 8-bit Lab scale, computed in floating point: an 8-bit
@@ -38,6 +43,8 @@ Lab round trip alone moves half the pixels of a JPEG by up to 15 levels.
 """
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import cv2
 import numpy as np
@@ -57,26 +64,47 @@ TOLERANCE = 7.0
 MIN_REGION_AREA = 24
 # Flat: FLAT_COVERAGE of the pixels within TOLERANCE of the field and
 # FLAT_COVERAGE_WIDE within twice that. Saturated fills carry stronger
-# blotches: the reference green "i" badge has 94% within 7 but 99% within 14.
-FLAT_COVERAGE = 0.90
+# blotches: the reference green "INICIO" pill has 89% within 7 but 99.9%
+# within 14.
+FLAT_COVERAGE = 0.85
 FLAT_COVERAGE_WIDE = 0.99
+# Text splits one fill into fragments (line gaps closed by descenders, letter
+# counters). Fragments within GROUP_RADIUS of each other whose colours differ
+# by at most GROUP_TOLERANCE share one field. On the reference diamond the gap
+# between two lines sat 21px from the body, beyond the band, and kept its
+# blotches; its colour differed by 5, blotchy counters by up to 8.4.
+GROUP_TOLERANCE = 12.0
+GROUP_RADIUS = 32
 # A designed fill is near-constant: the 98th percentile distance of its field
 # from the fill's median colour stays within FILL_RANGE. ChatGPT boxes measure
 # 1-2 (vignette included); shaded photo areas exceed it.
 FILL_RANGE = 8.0
 # Images whose large fills cover less than this share are not flat graphics
 # and are returned untouched. ChatGPT infographics measure ~70%; photos from
-# examples/ at most ~35%. Cleaning photos flattened cloud texture into patches.
-MIN_FILL_SHARE = 0.45
+# examples/ at most 45% (a Gemini thumbnail with a flat dark backdrop).
+# Cleaning photos flattened cloud texture into patches.
+MIN_FILL_SHARE = 0.50
+# Every pixel constant here is calibrated on ChatGPT's native output, 1024 or
+# 1536px on the long side. Larger images are measured for the photo guard on
+# a copy scaled to that size: at their native 2400px, two Gemini photos from
+# examples/ measured 0.46 and 0.49 and would have been flattened.
+GUARD_SIZE = 1536
 # Ringing beside bold text fuses whole lines into structure; 16px reaches the
 # middle of those blocks on 1K ChatGPT output.
 BAND_RADIUS = 16
-# Only regions this large define a background; smaller accepted regions
-# (gaps between letters and lines) take the extension of their nearest anchor,
-# computed by normalised convolution with ``EXTEND_SIGMA``.
+# Gradients above HARD_EDGE are design edges (badge rims, box outlines,
+# glyphs); they split the image into rooms. A band pixel takes the background
+# of a group in its own room before a nearer one across such an edge: inside
+# the reference "SI" badge the white page was nearer than the badge's own
+# fragments, and the rim kept its blotches. Blotches inside saturated fills
+# reach 13, the badge rim ~57.
+HARD_EDGE = 20.0
+# Only groups this large define a background; smaller isolated fills (gaps
+# between letters) take the extension of their nearest anchor, computed by
+# normalised convolution with ``EXTEND_SIGMA``.
 ANCHOR_AREA = 400
 EXTEND_SIGMA = 8.0
-# A smaller fill anchors itself when its colour differs from the surrounding
+# A smaller group anchors itself when its colour differs from the surrounding
 # background by DISTINCT_FILL: badges and circles ("SI", "NO"), whose white
 # text leaves only fragments of the fill. Gaps between glyphs share the box
 # colour and stay in the band.
@@ -115,12 +143,16 @@ def _to_rgb(lab: np.ndarray) -> np.ndarray:
     return np.clip(np.round(rgb), 0, 255).astype(np.uint8)
 
 
-def _structure_mask(lab: np.ndarray) -> np.ndarray:
+def _gradient(lab: np.ndarray) -> np.ndarray:
     gradient = np.zeros(lab.shape[:2], np.float32)
     for channel in range(3):
         gx = cv2.Scharr(lab[..., channel], cv2.CV_32F, 1, 0) / 16.0
         gy = cv2.Scharr(lab[..., channel], cv2.CV_32F, 0, 1) / 16.0
         gradient = np.maximum(gradient, np.hypot(gx, gy))
+    return gradient
+
+
+def _structure_mask(gradient: np.ndarray) -> np.ndarray:
     edges = (gradient > EDGE_THRESHOLD).astype(np.uint8)
     return cv2.dilate(edges, np.ones((3, 3), np.uint8))
 
@@ -131,25 +163,23 @@ def _masked_blur(values: np.ndarray, weight: np.ndarray, sigma: float) -> np.nda
     return numerator / np.maximum(denominator, 1e-6)[..., None]
 
 
-def _region_fields(lab, labels, stats, only=None):
-    """Fit a robust smooth field to each flat region.
+def _bounds(stats, members, pad, shape):
+    """Bounding box of a group of labels grown by ``pad``, clipped to ``shape``."""
+    x, y, box_w, box_h = (stats[members, i] for i in range(4))
+    return (
+        max(int(x.min()) - pad, 0),
+        max(int(y.min()) - pad, 0),
+        min(int((x + box_w).max()) + pad, shape[1]),
+        min(int((y + box_h).max()) + pad, shape[0]),
+    )
 
-    Returns ``(field, covered, deviations, accepted, fill_range)`` where
-    ``deviations`` holds each covered pixel's Lab distance to its field and
-    ``fill_range`` maps an accepted label to the colour range of its field.
-    ``only`` restricts the pass to already-accepted labels, which lets the
-    residual check re-measure exactly the regions that were cleaned.
-    """
+
+def _flat_regions(lab, labels, stats):
+    """Labels of the regions that are flat around a robust smooth field."""
     height, width = labels.shape
-    field = lab.copy()
-    covered = np.zeros(labels.shape, bool)
-    deviations = np.zeros(labels.shape, np.float32)
     accepted = []
-    fill_range = {}
     pad = int(3 * FIELD_SIGMA)
-    candidates = only if only is not None else range(1, len(stats))
-
-    for label in candidates:
+    for label in range(1, len(stats)):
         x, y, box_w, box_h, area = stats[label]
         if area < MIN_REGION_AREA:
             continue
@@ -166,65 +196,150 @@ def _region_fields(lab, labels, stats, only=None):
         # One robust pass: drop pixels far from the first estimate so a
         # small genuine feature does not tint the whole fill.
         estimate = _masked_blur(values, weight * (error < 2 * TOLERANCE), sigma)
-        error = np.sqrt(((values - estimate) ** 2).sum(2))
-        if only is None:
-            region_error = error[inside]
-            if (
-                (region_error < TOLERANCE).mean() < FLAT_COVERAGE
-                or (region_error < 2 * TOLERANCE).mean() < FLAT_COVERAGE_WIDE
-            ):
-                continue
-            colours = estimate[inside]
-            spread = np.sqrt(((colours - np.median(colours, axis=0)) ** 2).sum(1))
-            fill_range[label] = float(np.percentile(spread, 98))
+        error = np.sqrt(((values - estimate) ** 2).sum(2))[inside]
+        if (
+            (error < TOLERANCE).mean() >= FLAT_COVERAGE
+            and (error < 2 * TOLERANCE).mean() >= FLAT_COVERAGE_WIDE
+        ):
+            accepted.append(label)
+    return accepted
 
-        field[y0:y1, x0:x1][inside] = estimate[inside]
+
+def _group_regions(lab, labels, stats, candidates):
+    """Merge fragments of one fill that text split apart; returns label arrays."""
+    if not candidates:
+        return []
+    candidates = np.asarray(candidates)
+    count = len(stats)
+    colour = np.stack(
+        [np.bincount(labels.ravel(), lab[..., c].ravel(), count) for c in range(3)], 1
+    ) / np.maximum(stats[:, 4], 1)[:, None]
+    area = stats[:, 4].astype(np.float64)
+
+    # Only a fragment below ANCHOR_AREA joins a group, so pairs start from
+    # those. Every candidate within GROUP_RADIUS counts, not just the nearest
+    # region: flat stroke interiors of bold text sit between a line gap and
+    # its box.
+    is_candidate = np.zeros(count, bool)
+    is_candidate[candidates] = True
+    pairs = [np.zeros((0, 2), np.int64)]
+    for label in candidates[stats[candidates, 4] < ANCHOR_AREA]:
+        x0, y0, x1, y1 = _bounds(stats, [label], GROUP_RADIUS, labels.shape)
+        local = labels[y0:y1, x0:x1]
+        reach = cv2.distanceTransform((local != label).astype(np.uint8), cv2.DIST_L2, 3)
+        others = np.unique(local[reach <= GROUP_RADIUS])
+        others = others[is_candidate[others] & (others != label)]
+        pairs.append(np.stack([np.full(len(others), label), others], 1))
+    pairs = np.unique(np.sort(np.concatenate(pairs), 1), axis=0)
+    gaps = np.sqrt(((colour[pairs[:, 0]] - colour[pairs[:, 1]]) ** 2).sum(1))
+
+    # Closest colours merge first, and each merge is checked against the
+    # group's running colour so a chain of small steps cannot join distinct
+    # fills. Two groups that each hold an ANCHOR_AREA region never merge:
+    # large regions carry their own field, and pale boxes sit within
+    # GROUP_TOLERANCE of the white page around them.
+    parent = np.arange(count)
+    anchored = area >= ANCHOR_AREA
+
+    def find(label):
+        while parent[label] != label:
+            parent[label] = parent[parent[label]]
+            label = parent[label]
+        return label
+
+    for a, b in pairs[np.argsort(gaps)]:
+        root_a, root_b = find(a), find(b)
+        if root_a == root_b or (anchored[root_a] and anchored[root_b]):
+            continue
+        if np.sqrt(((colour[root_a] - colour[root_b]) ** 2).sum()) > GROUP_TOLERANCE:
+            continue
+        if area[root_a] < area[root_b]:
+            root_a, root_b = root_b, root_a
+        total = area[root_a] + area[root_b]
+        colour[root_a] = (colour[root_a] * area[root_a] + colour[root_b] * area[root_b]) / total
+        area[root_a] = total
+        anchored[root_a] |= anchored[root_b]
+        parent[root_b] = root_a
+
+    roots = np.array([find(label) for label in candidates])
+    return [candidates[roots == root] for root in np.unique(roots)]
+
+
+def _group_fields(lab, labels, stats, groups):
+    """Fit one robust smooth field to each group of regions.
+
+    Returns ``(field, covered, deviations, spread)`` where ``deviations``
+    holds each covered pixel's Lab distance to its field and ``spread`` the
+    colour range of each group's field (98th percentile distance from its
+    median). Also re-measures a cleaned image for the residual check.
+    """
+    field = lab.copy()
+    covered = np.zeros(labels.shape, bool)
+    deviations = np.zeros(labels.shape, np.float32)
+    spread = []
+    pad = int(3 * FIELD_SIGMA)
+    for members in groups:
+        x0, y0, x1, y1 = _bounds(stats, members, pad, labels.shape)
+        inside = np.isin(labels[y0:y1, x0:x1], members)
+        values = lab[y0:y1, x0:x1]
+        weight = inside.astype(np.float32)
+
+        estimate = _masked_blur(values, weight, FIELD_SIGMA)
+        error = np.sqrt(((values - estimate) ** 2).sum(2))
+        estimate = _masked_blur(values, weight * (error < 2 * TOLERANCE), FIELD_SIGMA)
+        error = np.sqrt(((values - estimate) ** 2).sum(2))
+
+        colours = estimate[inside]
+        distance = np.sqrt(((colours - np.median(colours, axis=0)) ** 2).sum(1))
+        spread.append(float(np.percentile(distance, 98)))
+        field[y0:y1, x0:x1][inside] = colours
         deviations[y0:y1, x0:x1][inside] = error[inside]
         covered[y0:y1, x0:x1] |= inside
-        accepted.append(label)
-    return field, covered, deviations, accepted, fill_range
+    return field, covered, deviations, spread
 
 
-def _distinct_fills(field, background, labels, stats, candidates):
-    """Small fills whose colour differs from the background around them."""
+def _distinct_fills(field, background, labels, stats, groups):
+    """Small groups whose colour differs from the background around them."""
     distinct = []
-    for label in candidates:
-        x, y, box_w, box_h, _ = stats[label]
-        inside = labels[y:y + box_h, x:x + box_w] == label
-        own = field[y:y + box_h, x:x + box_w][inside].mean(axis=0)
-        around = background[y:y + box_h, x:x + box_w][inside].mean(axis=0)
+    for members in groups:
+        x0, y0, x1, y1 = _bounds(stats, members, 0, labels.shape)
+        inside = np.isin(labels[y0:y1, x0:x1], members)
+        own = field[y0:y1, x0:x1][inside].mean(axis=0)
+        around = background[y0:y1, x0:x1][inside].mean(axis=0)
         if np.sqrt(((own - around) ** 2).sum()) >= DISTINCT_FILL:
-            distinct.append(label)
+            distinct.append(members)
     return distinct
 
 
-def _extend_background(field, labels, stats, anchors):
-    """Background for pixels near anchor regions, extended from the nearest one."""
-    height, width = labels.shape
-    anchor_mask = np.isin(labels, anchors)
-    # DIST_LABEL_PIXEL numbers the zero pixels in row-major order, which is
-    # the order np.nonzero returns them in.
-    _, nearest = cv2.distanceTransformWithLabels(
-        (~anchor_mask).astype(np.uint8), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL
-    )
-    ys, xs = np.nonzero(anchor_mask)
-    region_of = np.zeros(len(ys) + 1, np.int32)
-    region_of[1:] = labels[ys, xs]
-    nearest_region = region_of[nearest]
+def _extend_background(field, labels, stats, anchors, rooms):
+    """Background for pixels near anchor groups, extended from the nearest one.
+
+    A group in the pixel's own room (see ``HARD_EDGE``) wins over a nearer
+    one across a hard edge; pixels on a hard edge take the nearest group.
+    """
+    group_of = np.full(len(stats), -1, np.int32)
+    for index, members in enumerate(anchors):
+        group_of[members] = index
+    anchor_mask = group_of[labels] >= 0
     distance = cv2.distanceTransform((~anchor_mask).astype(np.uint8), cv2.DIST_L2, 3)
-    reach = distance <= BAND_RADIUS
 
     background = field.copy()
-    pad = BAND_RADIUS + 1
-    for label in anchors:
-        x, y, box_w, box_h, _ = stats[label]
-        x0, y0 = max(x - pad, 0), max(y - pad, 0)
-        x1, y1 = min(x + box_w + pad, width), min(y + box_h + pad, height)
-        inside = labels[y0:y1, x0:x1] == label
-        targets = (nearest_region[y0:y1, x0:x1] == label) & reach[y0:y1, x0:x1] & ~inside
+    best = np.full(labels.shape, np.inf, np.float32)
+    for index, members in enumerate(anchors):
+        x0, y0, x1, y1 = _bounds(stats, members, BAND_RADIUS + 1, labels.shape)
+        inside = group_of[labels[y0:y1, x0:x1]] == index
+        reach = cv2.distanceTransform((~inside).astype(np.uint8), cv2.DIST_L2, 3)
+        local_rooms = rooms[y0:y1, x0:x1]
+        own_rooms = np.unique(local_rooms[inside])
+        across = ~np.isin(local_rooms, own_rooms[own_rooms > 0])
+        score = reach + across * (2 * BAND_RADIUS)
+        targets = (
+            (reach <= BAND_RADIUS) & ~anchor_mask[y0:y1, x0:x1] & (score < best[y0:y1, x0:x1])
+        )
         if targets.any():
             extended = _masked_blur(field[y0:y1, x0:x1], inside.astype(np.float32), EXTEND_SIGMA)
             background[y0:y1, x0:x1][targets] = extended[targets]
+            best[y0:y1, x0:x1][targets] = score[targets]
     return background, anchor_mask, distance
 
 
@@ -272,23 +387,51 @@ def _stain_energy(deviations: np.ndarray, covered: np.ndarray) -> float:
     return float(deviations[covered].mean()) if covered.any() else 0.0
 
 
+class _Fills(NamedTuple):
+    gradient: np.ndarray
+    labels: np.ndarray
+    stats: np.ndarray
+    field: np.ndarray
+    covered: np.ndarray
+    deviations: np.ndarray
+    fills: list
+    large: list
+
+
+def _find_fills(lab: np.ndarray) -> _Fills:
+    gradient = _gradient(lab)
+    structure = _structure_mask(gradient)
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(1 - structure, connectivity=4)
+    groups = _group_regions(lab, labels, stats, _flat_regions(lab, labels, stats))
+    field, covered, deviations, spread = _group_fields(lab, labels, stats, groups)
+    fills = [members for members, colours in zip(groups, spread) if colours <= FILL_RANGE]
+    large = [members for members in fills if stats[members, 4].sum() >= ANCHOR_AREA]
+    return _Fills(gradient, labels, stats, field, covered, deviations, fills, large)
+
+
+def _measure(found: _Fills) -> dict:
+    fill_labels = np.concatenate(found.fills) if found.fills else np.zeros(0, np.int32)
+    # The photo guard counts large regions, not groups: fragments of a sky
+    # joined into one group must not lift a photo over MIN_FILL_SHARE.
+    fill_area = found.stats[fill_labels, 4]
+    fill_mask = np.isin(found.labels, fill_labels)
+    return {
+        "covered_fraction": round(float(found.covered.mean()), 4),
+        "fill_share": round(float(fill_area[fill_area >= ANCHOR_AREA].sum() / fill_mask.size), 4),
+        "regions": len(fill_labels),
+        "stain_energy_before": round(_stain_energy(found.deviations, fill_mask), 4),
+    }
+
+
 def clean_stains(image: Image.Image) -> tuple[Image.Image, dict]:
     """Return ``(result, report)``; ``result`` is ``image`` when untouched."""
     rgb = np.asarray(image.convert("RGB"))
-    lab = _to_lab(rgb)
-    structure = _structure_mask(lab)
-    _, labels, stats, _ = cv2.connectedComponentsWithStats(1 - structure, connectivity=4)
-    field, covered, deviations, accepted, fill_range = _region_fields(lab, labels, stats)
-    fills = [label for label in accepted if fill_range[label] <= FILL_RANGE]
-    large = [label for label in fills if stats[label][4] >= ANCHOR_AREA]
-    fill_mask = np.isin(labels, fills)
-
-    report = {
-        "covered_fraction": round(float(covered.mean()), 4),
-        "fill_share": round(float(stats[large, 4].sum() / labels.size) if large else 0.0, 4),
-        "regions": len(fills),
-        "stain_energy_before": round(_stain_energy(deviations, fill_mask), 4),
-    }
+    scale = GUARD_SIZE / max(rgb.shape[:2])
+    guard = rgb
+    if scale < 1:
+        guard = cv2.resize(rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    found = _find_fills(_to_lab(guard))
+    report = _measure(found)
     if (
         report["fill_share"] < MIN_FILL_SHARE
         or report["stain_energy_before"] < MIN_STAIN_ENERGY
@@ -296,10 +439,17 @@ def clean_stains(image: Image.Image) -> tuple[Image.Image, dict]:
         report.update(changed_fraction=0.0, stain_energy_after=report["stain_energy_before"])
         return image, report
 
-    background, _, _ = _extend_background(field, labels, stats, large)
-    small = [label for label in fills if stats[label][4] < ANCHOR_AREA]
+    lab = _to_lab(rgb)
+    if guard is not rgb:
+        found = _find_fills(lab)
+        report.update(_measure(found), fill_share=report["fill_share"])
+    gradient, labels, stats, field, _, _, fills, large = found
+
+    _, rooms = cv2.connectedComponents((gradient <= HARD_EDGE).astype(np.uint8), connectivity=4)
+    background, _, _ = _extend_background(field, labels, stats, large, rooms)
+    small = [members for members in fills if stats[members, 4].sum() < ANCHOR_AREA]
     anchors = large + _distinct_fills(field, background, labels, stats, small)
-    background, anchored, distance = _extend_background(field, labels, stats, anchors)
+    background, anchored, distance = _extend_background(field, labels, stats, anchors, rooms)
     band = ~anchored & (distance <= BAND_RADIUS)
 
     error = np.sqrt(((lab - background) ** 2).sum(2))
@@ -314,9 +464,7 @@ def clean_stains(image: Image.Image) -> tuple[Image.Image, dict]:
     output[changed] = cleaned_rgb[changed]
     result = Image.fromarray(output)
 
-    _, after_covered, after_deviations, _, _ = _region_fields(
-        _to_lab(output), labels, stats, only=fills
-    )
+    _, after_covered, after_deviations, _ = _group_fields(_to_lab(output), labels, stats, fills)
     report["changed_fraction"] = round(float(changed.mean()), 4)
     report["stain_energy_after"] = round(_stain_energy(after_deviations, after_covered), 4)
     return result, report
