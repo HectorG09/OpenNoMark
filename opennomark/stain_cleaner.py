@@ -15,13 +15,23 @@ Pipeline:
   3. Per region, a robust masked Gaussian field. A region is cleaned only if
      ``FLAT_COVERAGE`` of its pixels sit within ``TOLERANCE`` of that field;
      photographic texture fails this test and is never flattened.
-  4. The clean field is carried ``BAND_RADIUS`` pixels into the structure
-     band from the nearest accepted pixel, so blotches between glyphs are
-     removed too, while glyph pixels (far from the field) are not.
-  5. Soft blend: full replacement below ``TOLERANCE``, fading to none at
-     ``2 * TOLERANCE``. A hard cut draws contour lines through real gradients.
+  4. Soft blend inside accepted regions: full replacement below
+     ``TOLERANCE``, fading to none at ``2 * TOLERANCE``. A hard cut draws
+     contour lines through real gradients.
+  5. Text band: JPEG ringing beside glyphs is strong enough to count as
+     structure, so this band is where the most visible blotches live. The
+     field of the nearest large region (``ANCHOR_AREA``) is extended
+     smoothly ``BAND_RADIUS`` pixels into it; small gaps between glyphs are
+     band too, because their own fields are noisy and copying the single
+     nearest value drew streaks and stepped patches. Each band pixel is
+     modelled as a blend of background and the nearest ink (two-colour text
+     model) and projected onto that blend; only mostly-background pixels
+     (``MAX_INK_ALPHA``) are rebuilt, so glyph bodies and their anti-aliasing
+     profile are kept. Pixels lighter than the fill are stain.
 
-Distances are Euclidean in OpenCV's 8-bit Lab space.
+Untouched pixels are copied from the input bit for bit. Distances are
+Euclidean in OpenCV's 8-bit Lab scale, computed in floating point: an 8-bit
+Lab round trip alone moves half the pixels of a JPEG by up to 15 levels.
 """
 
 from __future__ import annotations
@@ -34,15 +44,34 @@ from PIL import Image
 # gradients on real ChatGPT samples stay below ~5; anti-aliased text edges
 # exceed 20.
 EDGE_THRESHOLD = 7.0
-# Field smoothness. Blotches are 8-16px; sigma 14 averages them out while
-# still following the soft vignettes ChatGPT paints inside boxes.
-FIELD_SIGMA = 14.0
+# Field smoothness. Most blotches are 8-16px but some reach ~25px; sigma 22
+# averages those out (sigma 14 left a visible disk in the reference sample)
+# while still following the 100-200px vignettes ChatGPT paints inside boxes.
+FIELD_SIGMA = 22.0
 # Lab distance treated as stain rather than content. Measured blotch p99 is
 # ~8 on the reference sample, so 7 with a soft fade to 14 covers it.
 TOLERANCE = 7.0
 MIN_REGION_AREA = 24
 FLAT_COVERAGE = 0.95
-BAND_RADIUS = 6
+# Ringing beside bold text fuses whole lines into structure; 16px reaches the
+# middle of those blocks on 1K ChatGPT output.
+BAND_RADIUS = 16
+# Only regions this large define a background; smaller accepted regions
+# (gaps between letters and lines) take the extension of their nearest anchor,
+# computed by normalised convolution with ``EXTEND_SIGMA``.
+ANCHOR_AREA = 400
+EXTEND_SIGMA = 8.0
+# Two-colour text model in the band. Ink is the colour farthest from the
+# background within ``INK_RADIUS``; it must differ by ``INK_MIN`` to define a
+# text/background line. Band pixels without ink nearby, or lighter than the
+# fill, are background: stains up to ``BAND_TOLERANCE`` are removed, fading to
+# none at 1.4x. Pixels farther than ``LINE_TOLERANCE`` from the line are a
+# third colour (icons, borders) and are left alone.
+INK_RADIUS = 2
+INK_MIN = 20.0
+MAX_INK_ALPHA = 0.35
+LINE_TOLERANCE = 12.0
+BAND_TOLERANCE = 20.0
 # Below this share of flat pixels the image is not a flat graphic.
 MIN_COVERED_FRACTION = 0.05
 # Mean Lab deviation inside flat regions below which there is nothing to
@@ -51,6 +80,21 @@ MIN_COVERED_FRACTION = 0.05
 MIN_STAIN_ENERGY = 0.25
 # The residual check requires at least this reduction of stain energy.
 MAX_RESIDUAL_RATIO = 0.5
+
+
+def _to_lab(rgb: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(rgb.astype(np.float32) / 255.0, cv2.COLOR_RGB2LAB)
+    lab[..., 0] *= 255.0 / 100.0
+    lab[..., 1:] += 128.0
+    return lab
+
+
+def _to_rgb(lab: np.ndarray) -> np.ndarray:
+    lab = lab.astype(np.float32)
+    lab[..., 0] *= 100.0 / 255.0
+    lab[..., 1:] -= 128.0
+    rgb = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB) * 255.0
+    return np.clip(np.round(rgb), 0, 255).astype(np.uint8)
 
 
 def _structure_mask(lab: np.ndarray) -> np.ndarray:
@@ -113,6 +157,76 @@ def _region_fields(lab, labels, stats, only=None):
     return field, covered, deviations, accepted
 
 
+def _extend_background(field, labels, stats, anchors):
+    """Background for pixels near anchor regions, extended from the nearest one."""
+    height, width = labels.shape
+    anchor_mask = np.isin(labels, anchors)
+    # DIST_LABEL_PIXEL numbers the zero pixels in row-major order, which is
+    # the order np.nonzero returns them in.
+    _, nearest = cv2.distanceTransformWithLabels(
+        (~anchor_mask).astype(np.uint8), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL
+    )
+    ys, xs = np.nonzero(anchor_mask)
+    region_of = np.zeros(len(ys) + 1, np.int32)
+    region_of[1:] = labels[ys, xs]
+    nearest_region = region_of[nearest]
+    distance = cv2.distanceTransform((~anchor_mask).astype(np.uint8), cv2.DIST_L2, 3)
+    reach = distance <= BAND_RADIUS
+
+    background = field.copy()
+    pad = BAND_RADIUS + 1
+    for label in anchors:
+        x, y, box_w, box_h, _ = stats[label]
+        x0, y0 = max(x - pad, 0), max(y - pad, 0)
+        x1, y1 = min(x + box_w + pad, width), min(y + box_h + pad, height)
+        inside = labels[y0:y1, x0:x1] == label
+        targets = (nearest_region[y0:y1, x0:x1] == label) & reach[y0:y1, x0:x1] & ~inside
+        if targets.any():
+            extended = _masked_blur(field[y0:y1, x0:x1], inside.astype(np.float32), EXTEND_SIGMA)
+            background[y0:y1, x0:x1][targets] = extended[targets]
+    return background, anchor_mask, distance
+
+
+def _neighbourhood_ink(lab: np.ndarray, background: np.ndarray):
+    """Return the colour farthest from each pixel's background nearby, and that distance."""
+    height, width = background.shape[:2]
+    r = INK_RADIUS
+    padded = cv2.copyMakeBorder(lab, r, r, r, r, cv2.BORDER_REPLICATE)
+    best = np.zeros((height, width), np.float32)
+    ink = lab.copy()
+    for dy in range(2 * r + 1):
+        for dx in range(2 * r + 1):
+            candidate = padded[dy:dy + height, dx:dx + width]
+            distance = ((candidate - background) ** 2).sum(2)
+            farther = distance > best
+            best[farther] = distance[farther]
+            ink[farther] = candidate[farther]
+    return ink, np.sqrt(best)
+
+
+def _band_targets(lab, background, band):
+    """Two-colour text model for the band; returns ``(target, weight)``."""
+    ink, ink_distance = _neighbourhood_ink(lab, background)
+    direction = ink - background
+    alpha = ((lab - background) * direction).sum(2) / np.maximum((direction ** 2).sum(2), 1e-6)
+    clamped = np.clip(alpha, 0.0, 1.0)
+    off_line = np.sqrt(((lab - background - clamped[..., None] * direction) ** 2).sum(2))
+    # Taper faint ink toward zero so the lightest stains beside glyphs vanish
+    # instead of surviving as a 5-10% ink tint.
+    tapered = np.where(clamped < 0.12, clamped * clamped / 0.12, clamped)
+    target = background + tapered[..., None] * direction
+
+    error = np.sqrt(((lab - background) ** 2).sum(2))
+    as_background = band & ((ink_distance < INK_MIN) | (alpha <= 0.0))
+    background_weight = np.clip((1.4 * BAND_TOLERANCE - error) / (0.4 * BAND_TOLERANCE), 0.0, 1.0)
+    on_line = (
+        band & ~as_background & (alpha < MAX_INK_ALPHA) & (off_line < LINE_TOLERANCE)
+    )
+    target = np.where(as_background[..., None], background, target)
+    weight = np.where(as_background, background_weight, on_line.astype(np.float32))
+    return target, weight
+
+
 def _stain_energy(deviations: np.ndarray, covered: np.ndarray) -> float:
     return float(deviations[covered].mean()) if covered.any() else 0.0
 
@@ -120,7 +234,7 @@ def _stain_energy(deviations: np.ndarray, covered: np.ndarray) -> float:
 def clean_stains(image: Image.Image) -> tuple[Image.Image, dict]:
     """Return ``(result, report)``; ``result`` is ``image`` when untouched."""
     rgb = np.asarray(image.convert("RGB"))
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab = _to_lab(rgb)
     structure = _structure_mask(lab)
     _, labels, stats, _ = cv2.connectedComponentsWithStats(1 - structure, connectivity=4)
     field, covered, deviations, accepted = _region_fields(lab, labels, stats)
@@ -137,28 +251,28 @@ def clean_stains(image: Image.Image) -> tuple[Image.Image, dict]:
         report.update(changed_fraction=0.0, stain_energy_after=report["stain_energy_before"])
         return image, report
 
-    # Carry each pixel's nearest accepted field value into the structure band.
-    # DIST_LABEL_PIXEL numbers the zero pixels in row-major order, which is
-    # the order np.nonzero returns them in.
-    _, nearest = cv2.distanceTransformWithLabels(
-        (~covered).astype(np.uint8), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL
-    )
-    ys, xs = np.nonzero(covered)
-    lookup = np.zeros((len(ys) + 1, 3), np.float32)
-    lookup[1:] = field[ys, xs]
-    field = lookup[nearest]
-    distance = cv2.distanceTransform((~covered).astype(np.uint8), cv2.DIST_L2, 3)
+    anchors = [label for label in accepted if stats[label][4] >= ANCHOR_AREA]
+    if not anchors:
+        report.update(changed_fraction=0.0, stain_energy_after=report["stain_energy_before"])
+        return image, report
+    background, anchored, distance = _extend_background(field, labels, stats, anchors)
+    band = ~anchored & (distance <= BAND_RADIUS)
 
-    error = np.sqrt(((lab - field) ** 2).sum(2))
-    blend = np.clip((2 * TOLERANCE - error) / TOLERANCE, 0.0, 1.0)
-    blend[distance > BAND_RADIUS] = 0.0
-    cleaned = lab + (field - lab) * blend[..., None]
-    cleaned = np.clip(np.round(cleaned), 0, 255).astype(np.uint8)
-    result = Image.fromarray(cv2.cvtColor(cleaned, cv2.COLOR_LAB2RGB))
+    error = np.sqrt(((lab - background) ** 2).sum(2))
+    target, weight = _band_targets(lab, background, band)
+    flat_weight = np.clip((2 * TOLERANCE - error) / TOLERANCE, 0.0, 1.0)
+    target[anchored] = background[anchored]
+    weight[anchored] = flat_weight[anchored]
+
+    changed = weight > 0
+    cleaned_rgb = _to_rgb(lab + (target - lab) * weight[..., None])
+    output = rgb.copy()
+    output[changed] = cleaned_rgb[changed]
+    result = Image.fromarray(output)
 
     _, after_covered, after_deviations, _ = _region_fields(
-        cleaned.astype(np.float32), labels, stats, only=accepted
+        _to_lab(output), labels, stats, only=accepted
     )
-    report["changed_fraction"] = round(float((blend > 0).mean()), 4)
+    report["changed_fraction"] = round(float(changed.mean()), 4)
     report["stain_energy_after"] = round(_stain_energy(after_deviations, after_covered), 4)
     return result, report

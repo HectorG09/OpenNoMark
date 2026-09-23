@@ -1,5 +1,6 @@
 """Shared fixtures for tests."""
 
+import io
 import os
 import tempfile
 
@@ -12,9 +13,11 @@ FILL = (250, 222, 226)
 INK = (20, 20, 20)
 
 
-def _stained_graphic(blotches=True, seed=0):
-    """A pink card with dark text, optionally carrying ChatGPT-like blotches.
+def _stained_graphic(blotches=True, seed=0, ink=INK, jpeg_quality=None):
+    """A pink card with text, optionally carrying ChatGPT-like blotches.
 
+    ``jpeg_quality`` recompresses the stained card the way chat apps do; that
+    adds the ringing beside glyphs where the most visible stains live.
     Returns ``(image, clean_reference, text_mask)``.
     """
     clean = np.full((240, 320, 3), FILL, np.float32)
@@ -25,13 +28,19 @@ def _stained_graphic(blotches=True, seed=0):
         stained += cv2.resize(coarse, (320, 240), interpolation=cv2.INTER_CUBIC) * 4.0
 
     text = np.zeros((240, 320), np.uint8)
-    cv2.putText(text, "Hola 2026", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 1.6, 255, 4, cv2.LINE_AA)
+    cv2.putText(text, "Hola 2026", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.6, 255, 4, cv2.LINE_AA)
+    cv2.putText(text, "dias del periodo", (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.9, 255, 2, cv2.LINE_AA)
     alpha = (text.astype(np.float32) / 255.0)[..., None]
-    ink = np.array(INK, np.float32)
+    ink = np.array(ink, np.float32)
     clean = clean * (1 - alpha) + ink * alpha
     stained = stained * (1 - alpha) + ink * alpha
     to_image = lambda array: Image.fromarray(np.clip(np.round(array), 0, 255).astype(np.uint8))
-    return to_image(stained), to_image(clean), text
+    image = to_image(stained)
+    if jpeg_quality:
+        buffer = io.BytesIO()
+        image.save(buffer, "JPEG", quality=jpeg_quality)
+        image = Image.open(io.BytesIO(buffer.getvalue())).convert("RGB")
+    return image, to_image(clean), text
 
 
 @pytest.fixture

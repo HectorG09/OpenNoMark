@@ -12,7 +12,10 @@ import torch
 # is required with a pin: torch.hub otherwise asks the GitHub API whether the
 # ref is the head of a branch or tag, which stops being true once master moves.
 NUNIF_REPO = "nagadomi/nunif:d23721f1b5f0a4c92c3ee1be013180bf298730c5"
-MODEL_TYPE = "art_scan"
+# "art", not "art_scan": the scan model reintroduces paper-like vertical
+# striations into flat white areas (column std 0.19 vs 0.00 on the reference
+# sample), which users see as leftover stains.
+MODEL_TYPE = "art"
 # Level 1 removes the JPEG ringing left around glyphs (inputs are usually
 # chat-app JPEGs) without softening fine lines; the stain cleaner has already
 # flattened the fills. MPS output matches CPU within 2/255 on the reference

@@ -23,15 +23,33 @@ def test_blotches_are_flattened_and_validated(stained_graphic):
     assert after < before * 0.5
 
 
+# Coloured ink after chat-app JPEG recompression: the case where an 8-bit Lab
+# round trip altered glyphs by 10 levels and ringing hid stains from cleanup.
+REALISTIC = {"ink": (30, 60, 140), "jpeg_quality": 75}
+
+
 def test_text_pixels_are_untouched(stained_graphic):
-    stained, _, text = stained_graphic()
+    stained, _, text = stained_graphic(**REALISTIC)
     result, _ = clean_stains(stained)
 
     glyph_core = cv2.erode(text, np.ones((3, 3), np.uint8)) == 255
     assert glyph_core.sum() > 200
-    original = np.asarray(stained, np.int16)[glyph_core]
-    cleaned = np.asarray(result, np.int16)[glyph_core]
-    assert np.abs(original - cleaned).max() <= 1
+    original = np.asarray(stained)[glyph_core]
+    cleaned = np.asarray(result)[glyph_core]
+    assert np.array_equal(original, cleaned)
+
+
+def test_stains_hugging_the_text_are_removed(stained_graphic):
+    """Ringing beside glyphs counts as structure; the text band must still be cleaned."""
+    stained, clean, text = stained_graphic(**REALISTIC)
+    result, _ = clean_stains(stained)
+
+    near = cv2.dilate(text, np.ones((9, 9), np.uint8)) > 0
+    band = near & (cv2.dilate(text, np.ones((3, 3), np.uint8)) == 0)
+    reference = np.asarray(clean, np.float32)[band]
+    before = np.abs(np.asarray(stained, np.float32)[band] - reference).mean()
+    after = np.abs(np.asarray(result, np.float32)[band] - reference).mean()
+    assert after < before * 0.4
 
 
 def test_clean_graphic_is_returned_unchanged(stained_graphic):
