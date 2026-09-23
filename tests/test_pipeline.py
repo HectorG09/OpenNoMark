@@ -121,3 +121,64 @@ class TestPipeline:
         assert meta["status"] == "cleaned"
         assert meta["watermarks_found"] >= 1
         assert os.path.exists(out_path)
+
+
+class TestStainsMode:
+    """Stains mode runs without LaMa/OWLv2 and never leaks metadata."""
+
+    @pytest.fixture
+    def pipeline(self):
+        from opennomark.pipeline import WatermarkRemovalPipeline
+        return WatermarkRemovalPipeline(verbose=False, load_models=False)
+
+    def test_stained_card_is_cleaned_without_detection_models(
+        self, pipeline, stained_graphic_path, tmp_path
+    ):
+        from PIL import JpegImagePlugin
+
+        output = tmp_path / "out.jpg"
+        _, meta = pipeline.process_stains(stained_graphic_path, str(output))
+
+        assert pipeline.localizer is None and pipeline.inpainter is None
+        assert meta["status"] == "cleaned"
+        assert meta["methods"] == ["flat_region_stain_cleanup"]
+        assert meta["validation"]["passed"]
+        saved = Image.open(output)
+        assert "exif" not in saved.info
+        assert b"ChatGPT" not in output.read_bytes()
+        assert JpegImagePlugin.get_sampling(saved) == 0  # 4:4:4
+
+    def test_clean_card_is_reported_without_writing(self, pipeline, stained_graphic, tmp_path):
+        source = tmp_path / "clean.png"
+        stained_graphic(blotches=False)[0].save(source)
+        output = tmp_path / "out.png"
+
+        _, meta = pipeline.process_stains(str(source), str(output))
+
+        assert meta["status"] == "no_watermark"
+        assert not output.exists()
+
+    def test_icc_profile_survives_the_save(self, pipeline, stained_graphic, tmp_path):
+        from PIL import ImageCms
+
+        icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        source = tmp_path / "p3.png"
+        stained_graphic()[0].save(source, icc_profile=icc)
+        output = tmp_path / "out.png"
+
+        pipeline.process_stains(str(source), str(output))
+
+        assert Image.open(output).info.get("icc_profile") == icc
+
+    def test_upscale_uses_the_enhancer(self, pipeline, stained_graphic_path, tmp_path):
+        class DoubleSize:
+            def upscale(self, image):
+                return image.resize((image.width * 2, image.height * 2))
+
+        pipeline._enhancer = DoubleSize()
+        result, meta = pipeline.process_stains(
+            stained_graphic_path, str(tmp_path / "out.jpg"), upscale=True
+        )
+
+        assert result.size == (640, 480)
+        assert meta["methods"] == ["flat_region_stain_cleanup", "waifu2x_noise_scale2x"]

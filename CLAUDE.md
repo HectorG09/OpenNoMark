@@ -14,6 +14,7 @@ uv sync --extra dev             # + pytest
 
 # CLI (entry point declared in pyproject.toml → opennomark.cli:main)
 uv run opennomark <files|dirs|globs> -o output/ [--debug] [--device cpu|cuda|mps]
+uv run opennomark <inputs> -o output/ --mode stains [--upscale]   # ChatGPT blotches, optional waifu2x 2x
 
 # API server (singleton pipeline loaded on first request)
 uv run uvicorn opennomark.api:app --port 48291
@@ -77,15 +78,30 @@ The older reverse-alpha helpers remain for experiments, but the production pipel
 
 **Inpainter (`opennomark/inpainter.py`)**: wraps a TorchScript LaMa model.
 - **Tight mask defaults (`padding=3, feather=4`) are load-bearing** — see the docstring at line 28. Larger values cause LaMa to bleed across high-contrast structural edges (e.g. paint white fabric over a black panel adjacent to a sparkle). Do not relax these without re-validating on the `examples/` set.
-- The model is downloaded on first run from `github.com/enesmsahin/simple-lama-inpainting/releases` to `~/.cache/torch/hub/checkpoints/big-lama.pt`.
+- The model is downloaded on first run from `github.com/enesmsahin/simple-lama-inpainting/releases` to `<torch hub dir>/checkpoints/big-lama.pt` (inside the project, see *Portable caches*).
 - Loaded with `map_location="cpu"` because the serialized checkpoint is CUDA — this is what lets it run on Mac.
 - After LaMa produces a result, `inpaint()` alpha-blends it back against the original using the feathered mask, so only the masked pixels are modified.
+
+### Stains mode (`opennomark/stain_cleaner.py`)
+
+ChatGPT infographics have no localized mark; their defect is an 8-16px blotch texture inside flat fills, strongest beside dark text. `--mode stains` / `mode=stains` skips the localizer entirely (OWLv2 erased the headline of the reference sample as a "watermark") and runs a deterministic cleaner: structure mask from Lab gradients, connected flat regions, a robust masked-Gaussian field per region, soft blend toward it, and the field carried a few pixels into the text band. Regions that are not flat within `TOLERANCE` are never touched, so photographs pass through unchanged. LaMa over a stain mask was measured and rejected: ~140s on CPU for a 1024x1536 sample and new speckles beside glyphs. Validation re-measures stain energy on the cleaned regions (`MAX_RESIDUAL_RATIO`), mirroring the residual check of the watermark path.
+
+Optional `upscale` runs waifu2x denoise level 1 + 2x (`opennomark/enhancer.py`, model `art_scan`) from the official `nagadomi/nunif` torch.hub entry, pinned to one commit; `skip_validation=True` is required with a pinned SHA. The model loads lazily on first use and downloads ~420MB.
+
+### Metadata (`opennomark/metadata.py`)
+
+Every output passes through `strip_metadata`, including unchanged copies returned by the API. It rewrites the JPEG/PNG/WebP container without re-encoding: EXIF, XMP, IPTC, comments, C2PA/JUMBF, PNG text chunks and data after EOI are dropped; JFIF, ICC, Adobe, and PNG colour chunks are kept. `_save_result` also carries the input's ICC profile (Mac screenshots are Display P3) and saves JPEG at 4:4:4.
+
+### Portable caches (`opennomark/portable.py`)
+
+This fork runs from a USB drive and must not write to the home directory. Importing `opennomark` from a source checkout points `XDG_CACHE_HOME` at `<project>/.cache` (torch hub, Hugging Face) and forces `TMPDIR` to `<project>/.cache/tmp` (macOS always sets its own). The `.app` launcher also sets `UV_CACHE_DIR` and `npm_config_cache` there. `.cache/` is git-ignored.
 
 ### Device selection
 
 Both models accept a `device` kwarg (passed through from the `--device` CLI flag) and auto-select when not given, but they select **differently**:
 
 - `WatermarkDetector` (OWLv2): MPS → CUDA → CPU.
+- `Waifu2xEnhancer`: CUDA → MPS → CPU (nunif's own selection for `device_ids=[0]`).
 - `LamaInpainter`: CUDA → CPU. **MPS requests are silently rewritten to CPU** because LaMa's TorchScript graph uses ops (e.g. FFT variants) that Apple MPS does not support — trying to run on MPS produces garbage, not an error. Do not "fix" this redirect without first confirming the full LaMa op set is MPS-supported.
 
 The checkpoint is CUDA-serialized, so `LamaInpainter` always loads with `map_location="cpu"` then `.to(self.device)` — loading directly to CUDA on a CPU-only machine would fail at unpickle time.

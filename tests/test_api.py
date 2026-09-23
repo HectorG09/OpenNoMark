@@ -175,6 +175,70 @@ class TestAPI:
         assert result["download_url"] is None
         assert "Residual watermark" in result["error"]
 
+    def test_stains_mode_uses_the_light_pipeline_and_forwards_upscale(
+        self, client, sample_image, monkeypatch
+    ):
+        import opennomark.api as api
+
+        calls = []
+
+        class StainPipeline:
+            def process(self, input_path, output_path):
+                raise AssertionError("watermark pipeline must not run in stains mode")
+
+            def process_stains(self, input_path, output_path, upscale):
+                calls.append(upscale)
+                image = Image.open(input_path).convert("RGB")
+                image.save(output_path)
+                return image, {"status": "cleaned", "watermarks_found": 1}
+
+        monkeypatch.setattr(api, "_stain_pipeline", StainPipeline())
+        monkeypatch.setattr(api, "_pipeline", StainPipeline())
+        with open(sample_image, "rb") as file:
+            response = client.post(
+                "/api/remove",
+                files=[("files", ("chart.png", file, "image/png"))],
+                data={"mode": "stains", "upscale": "true"},
+            )
+
+        result = response.json()["results"][0]
+        assert result["status"] == "cleaned"
+        assert result["mode"] == "stains"
+        assert calls == [True]
+
+    def test_unknown_mode_is_rejected(self, client, sample_image):
+        with open(sample_image, "rb") as file:
+            response = client.post(
+                "/api/remove",
+                files=[("files", ("chart.png", file, "image/png"))],
+                data={"mode": "everything"},
+            )
+        assert response.status_code == 422
+
+    def test_unchanged_download_has_no_metadata(self, client, tmp_path, monkeypatch):
+        import opennomark.api as api
+
+        class NothingFound:
+            def process(self, input_path, output_path):
+                return Image.open(input_path), {"status": "no_watermark", "watermarks_found": 0}
+
+        exif = Image.Exif()
+        exif[0x0131] = "ChatGPT"
+        source = tmp_path / "tagged.jpg"
+        Image.new("RGB", (32, 32), (200, 100, 50)).save(source, exif=exif)
+        monkeypatch.setattr(api, "_pipeline", NothingFound())
+        with open(source, "rb") as file:
+            response = client.post(
+                "/api/remove",
+                files=[("files", ("tagged.jpg", file, "image/jpeg"))],
+            )
+
+        result = response.json()["results"][0]
+        assert result["status"] == "no_watermark"
+        download = client.get(result["download_url"])
+        assert download.status_code == 200
+        assert b"ChatGPT" not in download.content
+
     def test_remove_no_files(self, client):
         resp = client.post("/api/remove")
         assert resp.status_code == 422  # validation error

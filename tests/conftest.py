@@ -2,8 +2,53 @@
 
 import os
 import tempfile
+
+import cv2
+import numpy as np
 import pytest
 from PIL import Image
+
+FILL = (250, 222, 226)
+INK = (20, 20, 20)
+
+
+def _stained_graphic(blotches=True, seed=0):
+    """A pink card with dark text, optionally carrying ChatGPT-like blotches.
+
+    Returns ``(image, clean_reference, text_mask)``.
+    """
+    clean = np.full((240, 320, 3), FILL, np.float32)
+    stained = clean.copy()
+    if blotches:
+        rng = np.random.default_rng(seed)
+        coarse = rng.normal(0.0, 1.0, (30, 40, 3)).astype(np.float32)
+        stained += cv2.resize(coarse, (320, 240), interpolation=cv2.INTER_CUBIC) * 4.0
+
+    text = np.zeros((240, 320), np.uint8)
+    cv2.putText(text, "Hola 2026", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 1.6, 255, 4, cv2.LINE_AA)
+    alpha = (text.astype(np.float32) / 255.0)[..., None]
+    ink = np.array(INK, np.float32)
+    clean = clean * (1 - alpha) + ink * alpha
+    stained = stained * (1 - alpha) + ink * alpha
+    to_image = lambda array: Image.fromarray(np.clip(np.round(array), 0, 255).astype(np.uint8))
+    return to_image(stained), to_image(clean), text
+
+
+@pytest.fixture
+def stained_graphic():
+    """Factory for a ChatGPT-like stained card and its clean reference."""
+    return _stained_graphic
+
+
+@pytest.fixture
+def stained_graphic_path(tmp_path):
+    """The stained card saved as a JPEG tagged with AI-provenance EXIF."""
+    image, _, _ = _stained_graphic()
+    exif = Image.Exif()
+    exif[0x0131] = "ChatGPT"
+    path = tmp_path / "chatgpt_card.jpg"
+    image.save(path, quality=95, exif=exif)
+    return str(path)
 
 
 @pytest.fixture

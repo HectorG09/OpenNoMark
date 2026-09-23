@@ -11,6 +11,7 @@ import tempfile
 import threading
 import zipfile
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
@@ -20,6 +21,8 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from . import __version__
+from .metadata import strip_metadata
+from .pipeline import MODES
 
 app = FastAPI(title="OpenNoMark", version=__version__)
 
@@ -34,6 +37,8 @@ app.add_middleware(
 # inference runs in worker threads instead of blocking the ASGI event loop.
 _pipeline = None
 _pipeline_init_lock = threading.Lock()
+# Stains mode needs neither OWLv2 nor LaMa; waifu2x loads lazily inside it.
+_stain_pipeline = None
 
 
 def _configured_concurrency() -> int:
@@ -158,12 +163,30 @@ def get_pipeline():
     return _pipeline
 
 
+def get_stain_pipeline():
+    global _stain_pipeline
+    if _stain_pipeline is None:
+        with _pipeline_init_lock:
+            if _stain_pipeline is None:
+                from .pipeline import WatermarkRemovalPipeline
+
+                _stain_pipeline = WatermarkRemovalPipeline(verbose=False, load_models=False)
+    return _stain_pipeline
+
+
+def _copy_without_metadata(source: Path, destination: Path) -> None:
+    shutil.copyfile(source, destination)
+    strip_metadata(destination)
+
+
 def _save_upload(upload: UploadFile, input_path: Path) -> None:
     with open(input_path, "wb") as file:
         shutil.copyfileobj(upload.file, file)
 
 
-async def _process_upload(upload: UploadFile, pipeline) -> dict:
+async def _process_upload(
+    upload: UploadFile, pipeline, mode: str = "watermark", upscale: bool = False
+) -> dict:
     if not upload.content_type or not upload.content_type.startswith("image/"):
         return {"filename": upload.filename, "error": "Not an image file"}
 
@@ -175,11 +198,19 @@ async def _process_upload(upload: UploadFile, pipeline) -> dict:
     try:
         await asyncio.to_thread(_save_upload, upload, input_path)
         async with _processing_slots:
-            _, meta = await asyncio.to_thread(
-                pipeline.process,
-                str(input_path),
-                str(output_path),
-            )
+            if mode == "stains":
+                _, meta = await asyncio.to_thread(
+                    pipeline.process_stains,
+                    str(input_path),
+                    str(output_path),
+                    upscale,
+                )
+            else:
+                _, meta = await asyncio.to_thread(
+                    pipeline.process,
+                    str(input_path),
+                    str(output_path),
+                )
         if meta["status"] == "partial":
             return {
                 "filename": upload.filename,
@@ -191,11 +222,13 @@ async def _process_upload(upload: UploadFile, pipeline) -> dict:
         if meta["status"] == "no_watermark":
             # An unchanged image is still a valid batch result. Keeping a copy
             # in the output directory makes single and ZIP downloads consistent.
-            await asyncio.to_thread(shutil.copyfile, input_path, output_path)
+            # The copy loses its metadata like every processed output does.
+            await asyncio.to_thread(_copy_without_metadata, input_path, output_path)
 
         return {
             "filename": upload.filename,
             "job_id": job_id,
+            "mode": mode,
             "status": meta["status"],
             "watermarks_found": meta["watermarks_found"],
             "download_url": f"/api/download/{job_id}{ext}",
@@ -222,11 +255,18 @@ def health():
 
 
 @app.post("/api/remove")
-async def remove_watermark(files: list[UploadFile] = File(...)):
-    """Remove watermarks with bounded, shared-model concurrency."""
-    pipeline = await asyncio.to_thread(get_pipeline)
+async def remove_watermark(
+    files: list[UploadFile] = File(...),
+    mode: Annotated[str, Form()] = "watermark",
+    upscale: Annotated[bool, Form()] = False,
+):
+    """Remove watermarks (or ChatGPT stains) with bounded, shared-model concurrency."""
+    if mode not in MODES:
+        raise HTTPException(422, f"mode must be one of {', '.join(MODES)}")
+    loader = get_stain_pipeline if mode == "stains" else get_pipeline
+    pipeline = await asyncio.to_thread(loader)
     results = await asyncio.gather(
-        *(_process_upload(upload, pipeline) for upload in files)
+        *(_process_upload(upload, pipeline, mode, upscale) for upload in files)
     )
     return {"results": results}
 

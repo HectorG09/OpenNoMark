@@ -37,7 +37,7 @@ def create_box_mask(image_size, boxes, padding=3, feather=4):
 
 class LamaInpainter:
     def __init__(self, device=None):
-        model_path = os.path.expanduser("~/.cache/torch/hub/checkpoints/big-lama.pt")
+        model_path = os.path.join(torch.hub.get_dir(), "checkpoints", "big-lama.pt")
         if not os.path.exists(model_path):
             from torch.hub import download_url_to_file
             url = "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"

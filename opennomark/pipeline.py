@@ -1,22 +1,67 @@
 """Core pipeline: detect watermarks and remove them."""
 
 import os
+import threading
+
 from PIL import Image, ImageChops, ImageFilter
 
-from .inpainter import LamaInpainter
-from .localizer import WatermarkLocalizer
+from .metadata import strip_metadata
+from .stain_cleaner import MAX_RESIDUAL_RATIO, clean_stains
+
+MODES = ("watermark", "stains")
 
 
 class WatermarkRemovalPipeline:
-    def __init__(self, device=None, verbose=True):
+    def __init__(self, device=None, verbose=True, load_models=True):
+        """``load_models=False`` builds a stains-only pipeline without LaMa/OWLv2."""
         self.verbose = verbose
+        self.device = device
+        self._enhancer = None
+        self._enhancer_lock = threading.Lock()
+        if not load_models:
+            self.localizer = None
+            self.inpainter = None
+            return
+        from .inpainter import LamaInpainter
+        from .localizer import WatermarkLocalizer
+
         if self.verbose:
             print("Loading inpainting model...")
-        self.device = device
         self.localizer = WatermarkLocalizer(device=device)
         self.inpainter = LamaInpainter(device=device)
         if self.verbose:
             print("Inpainting model loaded.")
+
+    @property
+    def enhancer(self):
+        """waifu2x, loaded on first use: it downloads ~420MB of models."""
+        if self._enhancer is None:
+            with self._enhancer_lock:
+                if self._enhancer is None:
+                    from .enhancer import Waifu2xEnhancer
+
+                    self._enhancer = Waifu2xEnhancer(device=self.device)
+        return self._enhancer
+
+    @staticmethod
+    def _save_result(result, image_path, output_path):
+        """Save in the input's format, then strip every metadata block.
+
+        The input's ICC profile is carried over: Mac screenshots are Display
+        P3, and dropping the profile shifts their colours.
+        """
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with Image.open(image_path) as source:
+            icc_profile = source.info.get("icc_profile")
+        options = {"icc_profile": icc_profile} if icc_profile else {}
+        ext = os.path.splitext(image_path)[1].lower()
+        if ext in (".jpg", ".jpeg"):
+            # 4:4:4 chroma: 4:2:0 subsampling smears colour around text and
+            # is what paints blotches into flat fills in the first place.
+            result.save(output_path, quality=95, subsampling=0, **options)
+        else:
+            result.save(output_path, **options)
+        strip_metadata(output_path)
 
     def process(self, image_path, output_path=None, save_debug=False):
         """Process a single image. Returns (result_image, metadata).
@@ -100,13 +145,7 @@ class WatermarkRemovalPipeline:
 
         # Save outputs
         if output_path:
-            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-            # Preserve original format
-            ext = os.path.splitext(image_path)[1].lower()
-            if ext in (".jpg", ".jpeg"):
-                result.save(output_path, quality=95)
-            else:
-                result.save(output_path)
+            self._save_result(result, image_path, output_path)
 
             if save_debug:
                 debug_dir = os.path.dirname(output_path)
@@ -165,12 +204,7 @@ class WatermarkRemovalPipeline:
             raise ValueError("No valid manual regions were supplied")
 
         if output_path:
-            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-            ext = os.path.splitext(image_path)[1].lower()
-            if ext in (".jpg", ".jpeg"):
-                result.save(output_path, quality=95)
-            else:
-                result.save(output_path)
+            self._save_result(result, image_path, output_path)
 
         return result, {
             "status": "cleaned",
@@ -182,6 +216,43 @@ class WatermarkRemovalPipeline:
                 "manual_confirmation": True,
             },
         }
+
+    def process_stains(self, image_path, output_path=None, upscale=False):
+        """Clean ChatGPT-style blotches in flat fills; optionally upscale 2x.
+
+        The watermark localizer does not run in this mode: on flat
+        infographics OWLv2 proposes headline text as a watermark, and the
+        reference ChatGPT sample lost its title that way. Validation mirrors
+        ``process``: the stain energy of the cleaned regions is re-measured
+        and must drop by ``MAX_RESIDUAL_RATIO``.
+        """
+        image = Image.open(image_path).convert("RGB")
+        result, report = clean_stains(image)
+        stains_cleaned = result is not image
+        methods = ["flat_region_stain_cleanup"] if stains_cleaned else []
+        if upscale:
+            result = self.enhancer.upscale(result)
+            methods.append("waifu2x_noise_scale2x")
+
+        passed = (
+            not stains_cleaned
+            or report["stain_energy_after"]
+            <= report["stain_energy_before"] * MAX_RESIDUAL_RATIO
+        )
+        metadata = {
+            "input": image_path,
+            "mode": "stains",
+            "methods": methods,
+            "stains": report,
+            "watermarks_found": int(stains_cleaned),
+            "regions": [],
+            "boxes": [],
+            "validation": {"passed": passed, "attempts": 1},
+            "status": ("cleaned" if passed else "partial") if methods else "no_watermark",
+        }
+        if output_path and methods:
+            self._save_result(result, image_path, output_path)
+        return result, metadata
 
     @classmethod
     def _overlapping_regions(cls, original_regions, residual_regions):
@@ -203,7 +274,10 @@ class WatermarkRemovalPipeline:
         )
         return intersection / reference_area if reference_area else 0.0
 
-    def process_batch(self, image_paths, output_dir, save_debug=False, callback=None):
+    def process_batch(
+        self, image_paths, output_dir, save_debug=False, callback=None,
+        mode="watermark", upscale=False,
+    ):
         """Process multiple images. callback(i, total, metadata) for progress."""
         os.makedirs(output_dir, exist_ok=True)
         results = []
@@ -217,7 +291,10 @@ class WatermarkRemovalPipeline:
             out_name = f"clean_{name}{ext}"
             out_path = os.path.join(output_dir, out_name)
 
-            _, meta = self.process(path, out_path, save_debug=save_debug)
+            if mode == "stains":
+                _, meta = self.process_stains(path, out_path, upscale=upscale)
+            else:
+                _, meta = self.process(path, out_path, save_debug=save_debug)
             meta["output"] = out_path
             results.append(meta)
 

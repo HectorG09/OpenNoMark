@@ -59,6 +59,15 @@ def main():
         "--device", choices=("cpu", "cuda", "mps"), default=None,
         help="Device: cpu, cuda, mps (default: auto)",
     )
+    parser.add_argument(
+        "--mode", choices=("watermark", "stains"), default="watermark",
+        help="watermark: detect and inpaint marks (default); "
+             "stains: clean ChatGPT blotches in flat fills",
+    )
+    parser.add_argument(
+        "--upscale", action="store_true",
+        help="Stains mode: also upscale 2x with waifu2x",
+    )
 
     args = parser.parse_args()
     paths = resolve_paths(args.inputs)
@@ -80,9 +89,16 @@ def main():
 
     from .pipeline import WatermarkRemovalPipeline
 
+    if args.upscale and args.mode != "stains":
+        parser.error("--upscale requires --mode stains")
+
     device = args.device
     try:
-        pipeline = WatermarkRemovalPipeline(device=device, verbose=not args.json)
+        pipeline = WatermarkRemovalPipeline(
+            device=device,
+            verbose=not args.json,
+            load_models=args.mode == "watermark",
+        )
     except Exception as exc:
         if args.json:
             print(json.dumps({
@@ -101,7 +117,9 @@ def main():
         status = meta["status"]
         found = meta["watermarks_found"]
         name = os.path.basename(meta["input"])
-        if status == "cleaned":
+        if status == "cleaned" and args.mode == "stains":
+            print(f"  [{i}/{total}] {name} -> {', '.join(meta['methods'])}")
+        elif status == "cleaned":
             print(f"  [{i}/{total}] {name} -> {found} watermark(s) removed")
         else:
             print(f"  [{i}/{total}] {name} -> no watermark found")
@@ -112,6 +130,8 @@ def main():
             args.output,
             save_debug=args.debug,
             callback=on_progress,
+            mode=args.mode,
+            upscale=args.upscale,
         )
     except Exception as exc:
         if args.json:

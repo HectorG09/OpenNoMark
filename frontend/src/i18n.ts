@@ -48,7 +48,14 @@ export interface Copy {
   uploading: (progress: number) => string;
   removingWatermark: string;
   removedCount: (count: number) => string;
+  stainsCleaned: string;
   noMarkReady: string;
+  modeLabel: string;
+  modeWatermark: string;
+  modeStains: string;
+  modeStainsHint: string;
+  upscaleLabel: string;
+  upscaleHint: string;
   needsAttention: string;
   ready: string;
   comparisonEmptyTitle: string;
@@ -151,7 +158,14 @@ const en: Copy = {
   uploading: (progress) => `Uploading ${progress}%`,
   removingWatermark: "Removing watermark",
   removedCount: (count) => `${count} removed`,
+  stainsCleaned: "Stains cleaned",
   noMarkReady: "No mark found · ready",
+  modeLabel: "What to remove",
+  modeWatermark: "Watermark",
+  modeStains: "ChatGPT stains",
+  modeStainsHint: "Flattens the blotches ChatGPT leaves in solid fills. Text, lines and icons stay untouched.",
+  upscaleLabel: "Upscale 2x with waifu2x",
+  upscaleHint: "AI super-resolution. The first run downloads about 420 MB of models.",
   needsAttention: "Needs attention",
   ready: "Ready",
   comparisonEmptyTitle: "Your comparison appears here",
@@ -254,7 +268,14 @@ const zhCN: Copy = {
   uploading: (progress) => `上传中 ${progress}%`,
   removingWatermark: "正在移除水印",
   removedCount: (count) => `已移除 ${count} 处`,
+  stainsCleaned: "斑点已清除",
   noMarkReady: "未发现水印 · 可下载",
+  modeLabel: "要去除的内容",
+  modeWatermark: "水印",
+  modeStains: "ChatGPT 斑点",
+  modeStainsHint: "抚平 ChatGPT 在纯色区域留下的斑点，文字、线条和图标保持不变。",
+  upscaleLabel: "用 waifu2x 放大 2 倍",
+  upscaleHint: "AI 超分辨率。首次使用会下载约 420 MB 模型。",
   needsAttention: "需要处理",
   ready: "就绪",
   comparisonEmptyTitle: "处理前后对比将在这里显示",

@@ -47,6 +47,19 @@ class TestCLI:
         assert payload["status"] == "error"
         assert payload["results"] == []
 
+    def test_upscale_requires_stains_mode(self, sample_image, output_dir):
+        result = self.run_cli(sample_image, "-o", output_dir, "--upscale")
+        assert result.returncode != 0
+        assert "--upscale requires --mode stains" in result.stderr
+
+    def test_stains_mode(self, stained_graphic_path, output_dir):
+        result = self.run_cli(stained_graphic_path, "-o", output_dir, "--mode", "stains")
+        assert result.returncode == 0, result.stderr
+        assert "flat_region_stain_cleanup" in result.stdout
+        output = os.path.join(output_dir, "clean_chatgpt_card.jpg")
+        with open(output, "rb") as file:
+            assert b"ChatGPT" not in file.read()
+
     def test_single_file(self, sample_image, output_dir):
         result = self.run_cli(sample_image, "-o", output_dir)
         assert result.returncode == 0

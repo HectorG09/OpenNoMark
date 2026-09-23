@@ -8,7 +8,28 @@
 
 OpenNoMark combines multi-expert watermark localization with content-aware LaMa inpainting. It keeps calibrated fast paths for Gemini, Doubao, Qwen, Jimeng, Kling, Tencent Yuanbao, Baidu, and similar generators, while adding a conservative generic path for compact visible text watermarks away from the corners. The complete workflow stays on your own machine.
 
-> The project removes visible overlays; it does not alter or remove invisible provenance metadata or content credentials.
+> Upstream OpenNoMark removes visible overlays only. **This fork additionally strips metadata (EXIF, XMP, IPTC, C2PA content credentials, PNG text chunks) from every output.** It does not attempt to remove invisible pixel watermarks, and metadata removal does not stop detectors that analyse pixel content.
+
+## Este fork · manchas de ChatGPT, waifu2x y metadatos
+
+Fork de [NanmiCoder/OpenNoMark](https://github.com/NanmiCoder/OpenNoMark) con tres añadidos:
+
+| Función | Qué hace | Cómo |
+| :--- | :--- | :--- |
+| **Modo «Manchas ChatGPT»** | Las infografías de ChatGPT no traen logo; traen un moteado de 8–16 px dentro de los rellenos de color, sobre todo junto al texto. Este modo lo aplana sin tocar texto, líneas ni iconos. | `opennomark/stain_cleaner.py`: segmenta rellenos planos por gradientes Lab, ajusta a cada uno un campo de color suave y mezcla hacia él. No ejecuta el detector de marcas: en infografías OWLv2 confundía el título con una marca. |
+| **waifu2x ×2 (opcional)** | Quita el ruido JPEG alrededor de las letras y duplica la resolución con IA. | Repo oficial [`nagadomi/nunif`](https://github.com/nagadomi/nunif) (sucesor en PyTorch de `nagadomi/waifu2x`) vía `torch.hub`, fijado a un commit. Modelo `art_scan`, quitarruido 1. ~420 MB la primera vez. |
+| **Sin metadatos** | Toda imagen que sale de la app va sin EXIF, XMP, IPTC, C2PA ni chunks de texto PNG. Se conserva el perfil de color. | `opennomark/metadata.py`: reescribe el contenedor JPEG/PNG/WebP sin recomprimir. |
+
+**Todo queda en la carpeta del proyecto** (pensado para correr desde una memoria USB): modelos, temporales, logs y cachés de `uv`/`npm` van a `.cache/` (ignorada por git), no a tu carpeta de usuario.
+
+**Apple Silicon:** OWLv2, el OCR y waifu2x corren en la GPU de Apple (MPS); LaMa corre en CPU porque sus operaciones FFT no funcionan en MPS. El Neural Engine solo es accesible vía Core ML, y estos modelos no se convierten de forma fiable, así que no se usa.
+
+```bash
+uv run opennomark infografia.jpg -o salida/ --mode stains             # limpiar manchas
+uv run opennomark infografia.jpg -o salida/ --mode stains --upscale   # + waifu2x ×2
+```
+
+En la interfaz web: elige **ChatGPT stains** en «What to remove» y, si quieres, marca **Upscale 2x with waifu2x**.
 
 [Web workbench](#web-workbench) · [Results](#real-image-results) · [Install](#choose-your-workflow) · [Architecture](#how-it-works) · [Verification](#dataset-and-verification)
 

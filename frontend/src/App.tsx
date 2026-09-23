@@ -30,6 +30,7 @@ import { useLocale } from "./i18n";
 import type { Copy } from "./i18n";
 
 type ResultStatus = "cleaned" | "no_watermark" | "error";
+type ProcessMode = "watermark" | "stains";
 type TaskPhase = "ready" | "queued" | "uploading" | "processing" | "done" | "error";
 type UiErrorCode = "connection" | "serverStatus" | "missingResult" | "incompleteResult" | "processing" | "download" | "unknown";
 
@@ -47,6 +48,7 @@ interface UiError {
 interface ProcessResult {
   filename: string;
   job_id?: string;
+  mode?: ProcessMode;
   status: ResultStatus;
   watermarks_found: number;
   download_url: string | null;
@@ -110,6 +112,7 @@ function normalizeResult(raw: Partial<ProcessResult> | undefined, file: File): P
   return {
     filename: raw.filename || file.name,
     job_id: raw.job_id,
+    mode: raw.mode,
     status: raw.status,
     watermarks_found: raw.watermarks_found || 0,
     download_url: raw.download_url || null,
@@ -119,12 +122,16 @@ function normalizeResult(raw: Partial<ProcessResult> | undefined, file: File): P
 
 function processImage(
   entry: ImageEntry,
+  mode: ProcessMode,
+  upscale: boolean,
   onProgress: (phase: "uploading" | "processing", progress: number) => void,
 ) {
   return new Promise<ProcessResult>((resolve, reject) => {
     const request = new XMLHttpRequest();
     const formData = new FormData();
     formData.append("files", entry.file);
+    formData.append("mode", mode);
+    formData.append("upscale", String(mode === "stains" && upscale));
 
     request.open("POST", "/api/remove");
     request.responseType = "json";
@@ -214,7 +221,9 @@ function QueueStatus({ entry, t }: { entry: ImageEntry; t: Copy }) {
       <span className="flex items-center gap-1.5 text-[11px] text-[var(--ink-muted)]">
         <StatusMark status={entry.result.status} />
         {entry.result.status === "cleaned"
-          ? t.removedCount(entry.result.watermarks_found)
+          ? entry.result.mode === "stains"
+            ? t.stainsCleaned
+            : t.removedCount(entry.result.watermarks_found)
           : entry.result.status === "no_watermark"
             ? t.noMarkReady
             : t.needsAttention}
@@ -304,6 +313,8 @@ export default function App() {
   const [dragActive, setDragActive] = useState(false);
   const [message, setMessage] = useState<UiMessage | null>(null);
   const [manualEditingId, setManualEditingId] = useState<string | null>(null);
+  const [mode, setMode] = useState<ProcessMode>("watermark");
+  const [upscale, setUpscale] = useState(false);
   const imagesRef = useRef<ImageEntry[]>([]);
 
   useEffect(() => {
@@ -414,7 +425,7 @@ export default function App() {
         return next;
       });
       try {
-        const result = await processImage(target, (phase, uploadProgress) => {
+        const result = await processImage(target, mode, upscale, (phase, uploadProgress) => {
           setImages((current) =>
             current.map((entry) =>
               entry.id === target.id ? { ...entry, phase, uploadProgress } : entry,
@@ -738,6 +749,47 @@ export default function App() {
               </span>
             </span>
           </label>
+
+          <fieldset className="mt-5" disabled={processing}>
+            <legend className="mb-2 font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--ink-faint)]">
+              {t.modeLabel}
+            </legend>
+            <div className="grid grid-cols-2 gap-1 rounded-full border border-[var(--line)] bg-[var(--paper)] p-1" role="radiogroup">
+              {(["watermark", "stains"] as const).map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  role="radio"
+                  aria-checked={mode === option}
+                  onClick={() => setMode(option)}
+                  className={`min-h-10 rounded-full px-3 text-sm font-medium transition-colors active:scale-[0.98] ${
+                    mode === option
+                      ? "bg-[var(--ink)] text-[var(--paper)]"
+                      : "text-[var(--ink-muted)] hover:text-[var(--ink)]"
+                  }`}
+                >
+                  {option === "watermark" ? t.modeWatermark : t.modeStains}
+                </button>
+              ))}
+            </div>
+            {mode === "stains" && (
+              <>
+                <p className="mt-2 text-xs leading-5 text-[var(--ink-muted)]">{t.modeStainsHint}</p>
+                <label className="mt-3 flex cursor-pointer items-start gap-2.5 text-sm">
+                  <input
+                    type="checkbox"
+                    className="mt-1 accent-[var(--accent)]"
+                    checked={upscale}
+                    onChange={(event) => setUpscale(event.target.checked)}
+                  />
+                  <span>
+                    <span className="block font-medium">{t.upscaleLabel}</span>
+                    <span className="block text-xs leading-5 text-[var(--ink-muted)]">{t.upscaleHint}</span>
+                  </span>
+                </label>
+              </>
+            )}
+          </fieldset>
 
           {message && (
             <div className="mt-4 flex items-start gap-2.5 border-l-2 border-[var(--danger)] py-1 pl-3 text-sm leading-6 text-[var(--ink-muted)]" role="alert">
